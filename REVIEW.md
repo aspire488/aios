@@ -1,164 +1,176 @@
-# Uncorrelated review — dev-review verification bound (`9b6a9286`)
+# Uncorrelated review — Actions control-plane strip + unit rewrite (`487ae3c2`)
 
-Reviewer: Claude Opus 5, branch `reviewspdrev` (worktree `/workspace/aios-reviewspdrev`).
-Commit under review: `9b6a9286` ("fix(ci): bound dev-review verification scope").
-Fixes committed locally as `8485af35` and `0a95da3e`. Nothing pushed, no PR opened.
+Reviewer: Claude Opus 5, branch `eumbotfcrev` (worktree `/workspace/aios-eumbotfcrev`).
+Commits under review: `f66485fb` ("fix: strip Actions runner file command paths") and
+`487ae3c2` ("fix: cover all Actions control env vars"), on top of `4ea7eefd`.
+Fixes committed locally as `2fd5e84f`. Nothing pushed, no PR opened.
 
 ## Verdict
 
-**The diagnosis is sound and the fix is the right shape — a prompt bound, not a
-timeout raise or a machinery rewrite — but it shipped with one material hole and
-a test that could not fail.** Both are fixed on this branch. Land after those two
-commits.
+**The diagnosis is right and the fix works — I reproduced the false-fail on the
+pre-fix tree and its absence after — but it shipped a formatting violation that
+CI's own lint job would have failed on the next push, and the requirement it was
+written to satisfy (the two new names in `_STRIPPED_ENV`) was not actually pinned
+by any test.** Both are fixed here, along with four smaller items. Ready for PR
+after `2fd5e84f`.
 
-The hole is not in what the bound forbids; it is in what the bound now
-*sanctions*. By elevating "focused tests for affected behavior" to the reviewer's
-principal form of verification, the change makes it load-bearing that the tree
-the reviewer tests is the PR. It is not: `/mnt/review` is a clone of the
-repository's **default branch**. That was tolerable while verification was
-unbounded and diffuse; it is not tolerable once focused tests are the whole
-verification budget, because a focused test run against master exercises the
-unchanged code and passes for the wrong reason. A fast review that silently
-verifies the wrong tree is a worse outcome than the 30-minute review it replaced.
+All six TASK.md / prompt checks pass on the reviewed tip; findings 1 and 2 are
+about how the change would have fared *next*, not about the behaviour it claims.
 
-## Issues found
+## Verification of the required points
 
-### Fatal
+| # | Requirement | Result |
+|---|---|---|
+| 1 | `_STRIPPED_ENV` gains `GITHUB_STEP_SUMMARY`, `GITHUB_STATE` | ✅ `scripts/eumemic_bot_review.py:124-129` |
+| 2 | Child env unreachable for `file_commands` paths under any key, name-strip not weakened | ✅ value strip added; all five names still in the list |
+| 3 | Test uses an explicit runner-env dict, no ambient substring assertion | ✅ `os.environ` replaced wholesale |
+| 4 | Launcher still reads `GITHUB_OUTPUT` from parent | ✅ `_record_published` (`:510`) reads its own `os.environ`; test green |
+| 5 | `origin/master` is an ancestor; prior #2404 harness commits retained | ✅ all nine (`0e727e02`…`487ae3c2`) present |
+| 6 | DONE.md claims match reality | ✅ root cause and pytest count confirmed; validation section incomplete (finding 1) |
 
-None. Publication, soft-fail, archive, timeout ordering, tool grants, and clone
-access are untouched by `9b6a9286` — verified against the diff. The change cannot
-regress the "green Action, no comment" class the launcher exists to prevent.
+**Root cause reproduced, not assumed.** Checked the pre-fix tree (`4ea7eefd`) out
+into the worktree and ran the test under a simulated hosted-runner environment
+carrying `_runner_file_commands` paths under `GITHUB_STEP_SUMMARY`,
+`GITHUB_STATE`, and one unrelated key:
+
+```
+3 failed, 50 deselected      # 4ea7eefd, same ambient env
+58 passed                    # this tip + fixes, same ambient env
+```
+
+DONE.md's "4 passed" for the named `-k` selection is accurate.
+
+## Findings
+
+### Blocking
+
+**1. `ruff format --check` fails on the rewritten test — CI's lint job would have
+gone red immediately.** `code-validation.yml:243` runs
+`ruff format --check src tests …`, which covers this file. The new set literal
+was written hand-wrapped:
+
+```python
+control_names = {
+    "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE"
+}
+```
+
+`ruff format` wants one element per line with a magic trailing comma, so
+`--check` reported `Would reformat: tests/unit/test_eumemic_bot_review.py` on the
+reviewed tip. This is the same failure class the task exists to close — green
+`pytest` locally, red CI — one job over. DONE.md's validation section lists only
+the pytest run; CLAUDE.md requires mypy, ruff check *and* ruff format before
+every commit. Fixed, and `ruff check`/`ruff format --check` are now clean over
+all of `src tests`.
 
 ### Serious
 
-1. **The reviewer's clone is on the default branch, not the PR — and the prompt
-   implied otherwise.** `GithubRepositoryResource`
-   (`src/aios/models/github_repositories.py:41`) has **no ref/branch/sha field**,
-   and `attach_session_repo` (`src/aios/sandbox/github_clone.py:290`) issues a
-   plain `git clone --reference <cache> --dissociate <url> <dest>` — default
-   branch HEAD, no checkout of anything else anywhere in the provisioning path
-   (`grep -rn "head_sha\|checkout" src/aios/sandbox/` finds only a docstring).
-   The launcher passes `CLONE_URL = head.repo.clone_url`, which for the ordinary
-   same-repo PR is `eumemic/aios` — i.e. **master**. The prompt said only "The
-   repository is cloned at /mnt/review", which any reader takes to mean the PR is
-   checked out there.
+**2. The name strip of `GITHUB_STEP_SUMMARY` / `GITHUB_STATE` — TASK.md item 1 —
+was not pinned by any test.** Deleting both names from `_STRIPPED_ENV` left the
+entire file green:
 
-   Corroboration that this is live, not theoretical: the DONE's own evidence for
-   PR #2362 reports the reviewer running "a base-code mutation run" — base code
-   is exactly what a default-branch clone hands it.
+```
+3 passed, 50 deselected      # with both names deleted, before this fix
+```
 
-   Fixed in `8485af35`: the prompt now states the clone is on the default branch,
-   names `head_sha` as the commit to reach, and gives the reviewer a check it can
-   run itself (`git -C /mnt/review rev-parse HEAD`). Fetch mechanics are left to
-   the model — `origin` is already the per-session git proxy, so `git fetch` works
-   from inside the sandbox, and per CLAUDE.md the model handles that failure
-   itself rather than the launcher scripting it.
+The reason is that the test's values for those two keys contain `file_commands`,
+so the *new value strip* removed them regardless of the name list. The two
+mechanisms were entangled, and the one the task was filed for was the one not
+under test. That matters because the value strip keys off `_runner_file_commands`
+— an undocumented internal of the runner's temp layout, not a contract. If GitHub
+renames that directory, the name list is the only cover left, and nothing would
+have caught its removal.
 
-2. **The new test asserts the constant's own words, so it cannot fail.**
-   `test_review_scope_avoids_repeating_ci_and_exhaustive_work` read
-   `reviewer.REVIEW_SCOPE` and asserted substrings of the literal it was written
-   from. Delete `{REVIEW_SCOPE}` from the f-string in `main()` and the bound stops
-   existing while the test stays green — a constant nothing sends is not a bound.
-   Nothing pinned the `infra/agents/dev-review.json` half either, and that half is
-   the *only* instruction a workflow child ever sees, so dropping it silently
-   relocates the expensive tool loop to the other caller rather than removing it.
+Fixed by splitting the mechanisms across two tests. New
+`test_control_variables_are_stripped_by_name_not_only_by_path` is parametrized
+over all five names and plants a value the marker cannot match
+(`/runner/_temp/control-plane-abc`), so only the name list can remove it. Both
+tests were mutation-checked: deleting the two names now fails 2 cases; deleting
+the value-strip clause fails 3.
 
-   Fixed in `0a95da3e`: `_Api` now records the `POST /v1/sessions` body, one test
-   asserts the bound and the head-checkout instruction against the
-   `initial_message` the launcher actually sends, and a second holds the same
-   bound in the committed manifest.
+### Minor
 
-### Minor (not fixed — flagged for the implementer's call)
+**3. The stronger value assertion was dropped when it no longer had to be.** The
+rewrite replaced `assert not [v for v in env.values() if "file_commands" in v]`
+with a single `assert "RUNNER_TEMP_SUMMARY" not in env`. That assertion was only
+unsafe because it ran over the *ambient* environment; once `os.environ` is
+replaced wholesale with an explicit dict it is both ambient-proof and strictly
+stronger than naming one key. Restored, with a comment saying why it is safe here.
 
-3. **The "unchanged substantive diff" clause is unactionable on the launcher
-   path.** It tells the reviewer not to repeat expensive checks "reported by an
-   earlier eumemic-bot review", but the launcher prompt passes **no comments**.
-   The manifest's request contract names `{repo, pr_number, head_sha, comments}`;
-   the launcher supplies repo/pr/sha and nothing else. The clause therefore only
-   binds if the model volunteers a `GET /repos/{repo}/issues/{n}/comments` — which
-   the http_server allowlist permits, but nothing directs. If it *does* volunteer
-   it, it pulls prior full review artifacts into context, which is itself a
-   non-trivial token cost. Either pass the comments or drop the clause; leaving it
-   inert is the one option that buys nothing. I did not change it because both
-   directions are product calls, not defects.
+**4. Nothing pinned the filter's blast radius.** No test asserted that an ordinary
+inherited variable *survives* `_agent_command`. `PATH` is load-bearing — the child
+needs it to find `codex` / `claude` / `pi` at all — and a value filter that
+over-matched would be invisible to the unit suite while breaking every real run.
+Added `PATH` to the runner env and asserted it comes through unchanged.
 
-4. **Repo-wide lint/type-check is forbidden; scoped lint/type-check is not
-   explicitly permitted.** The bound says "focused tests" but offers no scoped
-   counterpart for mypy/ruff, so a literal reader drops type-checking entirely.
-   Low impact in practice — this repo's mypy is invoked whole-package
-   (`uv run mypy src tests packages/...`), so a genuinely "scoped" run is not
-   really on offer — but the asymmetry is worth a word if the prompt is revised.
+**5. `_CONTROL_PATH_MARKERS` carried a dead element.**
+`("file_commands", "_runner_file_commands")` — the second can never match without
+the first, which is a substring of it. Collapsed to a single
+`_CONTROL_PATH_MARKER` and dropped the `any()`, per CLAUDE.md's extreme-simplicity
+line.
 
-5. **`uv sync --dev` is the floor under "focused tests".** The bound removes the
-   repo-wide *suites*, not the dependency install that running any test at all in
-   a fresh sandbox requires. Expect that fixed cost to survive. This is context
-   for reading the first post-fix run, not a defect.
+**6. The comment overclaimed the strip as containment.** "deny those paths
+wherever they occur" reads as though the agent can no longer reach the control
+files. It can: `RUNNER_TEMP` is still inherited, `_runner_file_commands` sits
+directly beneath it, and hosted runners default it to `/home/runner/work/_temp`,
+so `ls $RUNNER_TEMP/_runner_file_commands/` finds the UUID-named files without
+guessing. Left as defence in depth — stripping `RUNNER_TEMP` buys nothing against
+a predictable path — but the comment now says so, and points at the actual
+containment (`contents: read`, `persist-credentials: false`, both already in
+place). The rest of this file argues its security properties carefully; this line
+should not be the one that oversells.
 
-6. **~30s of tail slop in the launcher's poll (pre-existing, immaterial).**
-   `wait_for_events` (`src/aios/api/routers/sessions.py:1130`) returns the moment
-   events past `after` exist, so the DONE is right that the 30s is a long-poll
-   maximum and not a sleep. One wrinkle: `session_status` is read from the same
-   response, so if the final assistant event lands a beat before the step flips
-   the session out of `active`, one further poll can burn its full 30s. Bounded
-   and irrelevant against 10–30 minutes; noted only so it is not mistaken for a
-   regression when the post-fix timings come in.
+**7. Documentation gaps around the two new variables.** The `_STRIPPED_ENV`
+comment block gives a per-variable rationale for `GITHUB_OUTPUT` / `GITHUB_ENV` /
+`GITHUB_PATH` and nothing for the two additions; the test docstring likewise. Both
+now cover `GITHUB_STATE` (mutates later steps of this job) and
+`GITHUB_STEP_SUMMARY` (the "did not post" net writes the operator's account of
+the run there, `eumemic-bot-review.yml:137-145` — an agent holding that path
+writes the second half of the same forgery). Also fixed a stale cross-reference
+to `test_stripping_github_output_does_not_break_the_signal`, which has been
+`…_the_publication_signal` since `4ea7eefd`.
 
-## Fixes applied
+## Checked and deliberately not changed
 
-| SHA | Commit | Files |
-|---|---|---|
-| `8485af35` | `fix(ci): point the reviewer's clone at the PR head` | `scripts/eumemic_bot_review.py`, `docs/eumemic-bot-review.md` |
-| `0a95da3e` | `test(ci): pin the review bound to the prompt and the manifest` | `tests/unit/test_eumemic_bot_review.py` |
+- **`monkeypatch.setattr(reviewer.os, "environ", runner_env)`** swaps the real
+  `os.environ` for a plain dict process-wide for the test's duration — broader
+  than it looks. Kept: `_agent_command` is a pure call, monkeypatch restores it,
+  and full replacement is the only way to be genuinely ambient-proof, which is
+  the whole point of the rewrite.
+- **Stripping `GITHUB_STEP_SUMMARY` from the child does not break the safety
+  net's summary.** That step runs in its own runner shell with its own
+  environment (`eumemic-bot-review.yml:137`), not in the agent's — the same
+  argument that makes the `GITHUB_OUTPUT` strip free.
+- **`scripts/` is outside CI's ruff and mypy paths** (`code-validation.yml:242-246`
+  covers `src tests packages/… connectors/…`), so the launcher itself is
+  unlinted either way. Ran both against it by hand — clean. Widening the CI paths
+  to include `scripts/` is a real gap but belongs to its own change.
 
-Checks after both: `uv run pytest tests/unit/test_eumemic_bot_review.py -q` — 13
-passed; full `uv run pytest tests/unit -q -n 4` — 6073 passed; `ruff check` /
-`ruff format --check` clean on the touched paths; `mypy tests/unit/...` clean.
-(`mypy scripts/` reports pre-existing bare-`dict` generics also present on
-`origin/master`; `scripts/` is not in CI's mypy target, so it is out of scope.)
+## Commands run
 
-## Do the DONE's claims hold?
+```
+uv run pytest -q tests/unit/test_eumemic_bot_review.py            # 53 -> 58 passed
+uv run mypy tests/unit/test_eumemic_bot_review.py                 # clean
+uv run ruff check src tests && uv run ruff format --check src tests
+uv run bash scripts/verify_eumemic_bot_review_gate.sh             # ALL CHECKS PASSED
+```
 
-**Root cause — holds, with one caveat about provenance.** "The dominant
-wall-clock cost is the review model's self-directed tool loop" is consistent with
-everything I can check in-repo: the launcher prompt genuinely placed no bound on
-verification, the manifest genuinely encouraged deeper inspection via the clone,
-and the reviewer genuinely has `bash` plus a full working tree. I could **not**
-independently re-verify the GitHub run timings (#2371/#2380/#2362) from this
-checkout — no network to the Actions API, and the DONE itself notes the older
-logs have expired. I take the timing evidence as reported. The mechanism stands
-on its own, and the "base-code mutation run" detail in the cited artifact turned
-out to be an independent tell for issue 1 above.
+The gate script is the sanctioned one-command re-verification from the previous
+round, and it still passes end to end: 58 unit tests, the GITHUB_OUTPUT mutant
+killed, the forged-`published=true` attack refused with the safety net still
+firing, and the honest agent still publishing.
 
-**"Checkout, token mint, publication, archive, and the long-poll are not material"
-— holds.** The long-poll half I verified directly in the endpoint code (see
-minor 6). The publication path is a single POST plus a marker round-trip.
+Plus the pre-fix reproduction, the simulated-runner ambient run, and the three
+mutation checks quoted above.
 
-**"Publication, soft-fail behavior, timeouts, clone access, tools, and targeted
-bug-catching verification are unchanged" — holds** for the first five, verified
-against `git diff origin/master...HEAD`. The sixth ("targeted bug-catching
-verification unchanged") is the claim that did **not** hold as landed: targeted
-verification against a master tree is not targeted verification of the PR. It
-holds after `8485af35`.
-
-**"53 passed" and "`git diff --check` clean" — reproduced** at `9b6a9286`.
-
-**"No post-fix live timing exists; do not claim a precise old/new number" —
-holds, and is the right call.** Nothing in this branch licenses a speedup figure
-before the first live run. Read that run for two things, not one: the elapsed
-time, and whether the artifact shows the reviewer actually reached `head_sha` in
-`/mnt/review`.
-
-## What I did not verify
-
-- Live behaviour of the reviewer under the new prompt. Prompt bounds are
-  probabilistic; only a real run shows whether the model honours them, and
-  whether it honours the checkout instruction in particular.
-- That `git fetch origin pull/<n>/head` specifically succeeds through the
-  per-session git proxy. The proxy is documented to forward smart-HTTP fetch with
-  auth injected, and the prompt deliberately does not prescribe the mechanics, so
-  a model that finds one route blocked can take another — but this is the one
-  step of `8485af35` that wants confirmation from the first live run.
-- Fork PRs. `CLONE_URL` is the *head* repo, so on a fork the clone is the fork's
-  default branch and `pull/<n>/head` does not exist there; `head_sha` does. The
-  prompt asks for the SHA rather than a ref, which is the right shape for both
-  cases, but no fork PR has exercised it.
+**Full unit suite — two runs, and they do not agree.** `uv run pytest tests/unit
+-q -n 4` gave `10 failed, 6178 passed` and then `2 failed, 6186 passed`, with
+*disjoint* failure sets (`test_attachment_staging`, `test_host_dir_reaper`,
+`test_image_resize`, `test_revocation_kinds_coverage` in the first;
+`test_invoke_session_tools`, `test_litellm_param_validation` in the second).
+Every one of them passes when its file is run on its own, so these are
+pre-existing ordering/parallelism flakes under xdist, not regressions: this
+branch changes no `src/` file, and none of the failing test files differ from
+`origin/master`. Reporting it because the numbers are real, not because it
+blocks this PR — but a suite whose failure set changes run to run is worth its
+own issue.
