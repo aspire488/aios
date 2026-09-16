@@ -326,11 +326,13 @@ class Settings(BaseSettings):
         ge=0,
         description="Writable-layer byte floor at/below which a snapshot is "
         "treated as a no-write identity (``skipped_empty`` — no new image, no "
-        "chain growth). NOT zero: on the production **containerd image store** "
-        "a no-write container reports ``SizeRw == 4096``, not 0, so an "
-        "``== 0`` test would never fire in prod and chat-only / read-only "
-        "sessions would grow a chain every idle. The floor (default 8 KiB) is "
-        "what keeps them from ever snapshotting.",
+        "chain growth). Applied to ``SizeRw - baseline``, where baseline is "
+        "the container's ``SizeRw`` stamped at create before tenant exec. NOT "
+        "zero: on the production **containerd image store** a no-write "
+        "container reports ``SizeRw == 4096``, not 0, so an ``== 0`` test "
+        "would never fire in prod. The floor (default 8 KiB) is headroom "
+        "above the measured empty layer so chat-only / read-only sessions "
+        "never snapshot, regardless of store or runtime copy-up.",
     )
     sandbox_seccomp_profile: str = Field(
         default=str(Path(__file__).resolve().parents[2] / "docker" / "seccomp-sandbox.json"),

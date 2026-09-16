@@ -1,182 +1,164 @@
-# Uncorrelated review — aios#2410 tip `84aa0759`
+# Uncorrelated review — aios#2432 fixround, round `gvisfloor3`
 
-- **Round**: `botpost2410u` (implementer grok-4.6, worktree `aios-botpost2410u`)
-- **Checker**: claude-opus-5, worktree `aios-botpost2410urev`, branch `botpost2410urev` (maker ≠ checker)
-- **Tip reviewed**: `84aa075961fa370debec3d45e98195a086d21b19` "fix(ci): let dropped review uid enter a 0700 runner home"
-- **Verdict**: **PASS** — the live FATAL is closed, and I reproduced both halves of the
-  A/B on a real `setpriv` drop to a real unprivileged uid. F2, the High privilege
-  boundary, the Medium digest gate and the keep list are all intact.
+**Tip reviewed:** `5683c1b861e1b8d28ad71fffc2535225529e4565`
+("fix(sandbox): retry credential DNS bind on dual-protocol EADDRINUSE")
+**Branch:** `gvisfloor3rev` (forked from implement tip on `gvisfloor3`)
+**Implementer:** grok-4.6 · **Checker:** claude-opus-5 (maker ≠ checker)
+**PR:** https://github.com/eumemic/aios/pull/2432 (branch `gvisfloor`)
+**Scope:** light review — focused unit tests only, no docker e2e, no `-n`.
 
-State: `origin/gvisorgrn = 5766de7d`; HEAD is one product commit ahead and **unpushed**.
-Not pushed, not merged, no PR opened. `TASK.md` is dirty (Shepherd's round file) and
-untouched. The tip touches four files and no `src/`: `DONE.md`,
-`docs/eumemic-bot-review.md`, `scripts/eumemic_bot_review.py`,
-`tests/unit/test_eumemic_bot_review.py`.
+## Verdict: **FAIL** — one Medium defect (latent fail-open), **fixed in this worktree**
 
-## Method
+The diagnosis and the shape of the fix are right: TCP-first ephemeral bind +
+UDP attach on the same port + bounded `EADDRINUSE` retry is the correct answer
+to the CI red, and it does not weaken the one-resolver-per-session property.
+The defect is in how `start()` decides it succeeded: it replaced a
+structurally-enforced fail-closed postcondition with a check on mutable
+instance state that `stop()` never clears, so a resolver that bound once can
+return from a *failing* `start()` reporting a stale port with nothing
+listening on it. In the module whose entire job is failing closed, that is not
+a shape to ship. Reproduced, fixed, and covered by a regression test below.
 
-Same posture as the previous two rounds: the committed tests still stub the boundary, so
-nothing in-tree can prove reachability. I drove the **real** `_run_harness` through a
-**real** `sudo setpriv` drop to the **real** unprivileged `eumemic-review` user (uid 998,
-no sudo) against a **real** git repo sitting under a **0700** `$HOME` — the ubuntu-latest
-shape from the live Action. Every claim below is a reproduction, not a reading.
+---
 
-## F1 — live FATAL: closed (A/B proof)
+## Findings
 
-`_ensure_dropped_uid_can_enter` (`scripts/eumemic_bot_review.py:441`) is called from
-`_run_harness` (`:986`) on the dropped path, before `_verify_dropped_diff`. It adds
-other-**execute** on every ancestor of the checkout and `a+rX`-equivalent bits on the
-checkout itself.
+### M1 (Medium, FIXED) — `start()` could return "started" while unbound
 
-The same driver, same repo, same 0700 `$HOME`, with the new function neutered vs. as
-committed:
+`src/aios/sandbox/credential_dns.py` — as committed:
 
-```
-===== WITHOUT the new opener (fix neutered) =====
-DRIVER launcher evidence: (19, 'eb5f3889...67b7')
-FATAL: dropped user eumemic-review cannot git diff 8be94c73...b78ed901:
-  fatal: cannot change to '/tmp/rev2410u/home/runner/work/aios/aios': Permission denied
-DRIVER SystemExit: 1
-
-===== WITH the opener (as committed) =====
-HARNESS uid=998 cwd=/tmp/rev2410u/home/runner/work/aios/aios HOME=/tmp/eumemic-review-7ohpca52/agent
-HARNESS git rc=0 stderr=
-HARNESS lines=19 sha=eb5f38899a4cf17046a0c18463f56e9e6f27182076f623766d69fac3e57e67b7
-DRIVER RETURNED ARTIFACT:
-### Code review
-...
-<!-- inspected: lines=19 sha256=eb5f3889...67b7 -->
-EXIT=0
+```python
+for attempt in range(_BIND_ATTEMPTS):
+    ...
+    except OSError as exc:
+        last_exc = exc
+        await self.stop()
+        if exc.errno != errno.EADDRINUSE or attempt + 1 == _BIND_ATTEMPTS:
+            break
+if self._port is None:                      # <-- success predicate
+    raise CredentialDnsError(...) from last_exc
 ```
 
-The neutered run reproduces TASK's live error **verbatim** (`cannot change to '...':
-Permission denied`); the committed code makes the dropped uid enter the checkout, read
-`.git`, and emit a **non-empty digest that matches the launcher's**. The shape is also
-diagnosis-independent: it opens *every* ancestor rather than betting on which component
-was restrictive, so it closes the class, not just the observed instance.
+`stop()` does not clear `self._port` (it still reads it for the
+`credential_dns.stopped` log line). So `self._port is None` only answers "did
+we bind?" for an instance that has never bound. For an instance that bound
+once and was stopped, every bind attempt can fail and `start()` still falls
+through to `log.info("credential_dns.started", port=<previous run's port>)`
+and returns — the caller then DNATs the sandbox's `udp/53` + `tcp/53` at a
+port this process no longer owns, with no interception behind it. That is a
+fail-open in the path whose own docstring says a failed bind "turns into a
+failed provision, because a sandbox whose credential names cannot be pinned
+must not be handed a credential", and it contradicts CLAUDE.md's *fail hard,
+no fallbacks* / *correct-by-construction*.
 
-Three properties I checked because they could have turned this fix into a different
-failure:
-
-- **It does not perturb the digest.** Files get `+r` only, never `+x`, so no tracked file
-  flips `100644`→`100755` between `diff_evidence` (computed before the walk) and the
-  agent's own hash. Verified with a tracked `0755` script and a tracked `0600` file in the
-  tree: digest byte-identical before/after, `git status --porcelain` clean, `run.sh` still
-  `-rwxr-xr-x`.
-- **It does not open `$HOME` for reading.** `0700` → `0711`, traverse-only. Live, as the
-  dropped uid: `LIST_HOME=denied`, `READ_PRIVATE=denied` (a `0600` sibling), while
-  `ENTER_CHECKOUT=ok`.
-- **It is not a cost.** The walk on the real aios checkout (fetch-depth-0, 68M `.git`) is
-  605 dirs / 4940 files, **1** of which needs a chmod at all, at 0.11s. No sudo fallback
-  fires in the CI shape, where the runner owns the whole tree.
-
-## F2 — cleanup: still closed
-
-`os.chmod(root, 0o711)` (`:978`, the leftover applied from last round) plus the chown
-narrowed to `agent/` plus `_rmtree_maybe_foreign` in the `finally` (`:1023`). Across three
-real dropped runs in this review — success, heading-only refusal, and the FATAL path —
-**zero** `/tmp/eumemic-review-*` directories leaked and no `PermissionError` traceback
-appeared. (The three leftovers on this box timestamp 19:18–19:21, i.e. the implementer's
-own probes before the fix, not my runs at 20:05–20:07.) The NO_EVIDENCE exit is not
-swallowed: exit **3** with the banner and the `::error` annotation, nothing written.
-
-## High — privilege boundary: still closed
-
-Untouched by this tip, and re-verified live rather than assumed. As the dropped uid:
-`SUDO=denied`, `READ_OTHER_ENVIRON=denied`, harness `uid=998` while the launcher stayed
-uid 1000. `_require_agent_user` (`:342`) still fails closed on uid 0, a shared euid, and a
-user it cannot prove is outside `sudo`/`admin`/`wheel`. The reusable key stays in the
-launcher's `_ProxyBroker`; the spec crossing the boundary carries only the loopback token;
-`REVIEW_PROXY_KEY_FILE` is read and unlinked in `_proxy_key` **before** anything is
-widened, so the staged key is gone from the filesystem by the time the agent can traverse
-`RUNNER_TEMP`. Nothing in prose passes prctl+broker off as the boundary. The new walk adds
-only `r`/`x`, never `w`, so the agent still cannot tamper with the workspace or the
-artifact path.
-
-## Medium — artifact gate: still closed
-
-`require_inspection_evidence` (`:611`) is untouched, still called inside `_run_harness`
-(`:1010`) and again in `run_agent_phase` before the write, still full-64-hex-only. Live
-heading-only harness, through the real drop:
+Reproduced against the committed tip (`_BIND_ATTEMPTS=2`, all binds raising
+`EADDRINUSE`, after one successful start/stop):
 
 ```
-FATAL: NO EVIDENCE OF INSPECTION — refusing to publish a verdict: ... no well-formed
-`<!-- inspected: lines=<N> sha256=<HEX> -->` line ...
-DRIVER SystemExit: 3
+credential_dns.started  port=40707      <- first, real start
+credential_dns.stopped  port=40707
+credential_dns.stopped  port=40707      <- retry 1 failed
+credential_dns.stopped  port=40707      <- retry 2 failed
+credential_dns.started  port=40707      <- BUG: returns OK, nothing bound
 ```
 
-Note the gate is now *reachable on its merits* for the first time: previously every run
-died before the harness, so the digest channel had never actually accepted a real dropped
-agent's evidence. It does now.
+Not reachable in production **today** — `SecretEgressProxy.__init__` builds a
+fresh `CredentialDnsResolver` and `SecretEgressProxy.start()` is called once
+per proxy (`spec.py:803`, `spec.py:947`) — which is why this is Medium and not
+High. It is nonetheless a defect introduced by this commit: the pre-tip code
+raised from inside the `except`, so the postcondition held for any call
+sequence.
 
-## Keep list — intact
+**Fix applied here:** raise from inside the loop; the loop now either binds or
+raises, with no post-loop state check and no `last_exc` bookkeeping (net
+simpler than the committed form).
 
-The tip touches no `src/`. Hosts-first `resolve_ipv4` / `build_resolve_ipv4_fn` with
-`ResolveScope` and operator-controlled `operator_hosts` (`src/aios/sandbox/setup.py:490`,
-`:532`, `:567`), the runsc gateway bake (`.github/workflows/gvisor-validation.yml`), and
-proxy-key-out-of-harness-env (`REVIEW_PROXY_KEY_FILE` staged in its own step, read and
-unlinked, plus `_STRIPPED_ENV`) are all unchanged.
+```python
+for attempt in range(_BIND_ATTEMPTS):
+    try:
+        await self._bind()
+        break
+    except OSError as exc:
+        await self.stop()
+        if exc.errno != errno.EADDRINUSE or attempt + 1 == _BIND_ATTEMPTS:
+            raise CredentialDnsError("credential DNS resolver failed to bind") from exc
+    except BaseException as exc:
+        await self.stop()
+        raise CredentialDnsError("credential DNS resolver failed to bind") from exc
+```
 
-## Checks run
+Regression test added: `test_failed_restart_does_not_report_a_stale_port`
+(verified RED on the committed tip, GREEN after the fix).
 
-Focused only, per the ops constraint — no full suite, no `-n`:
+### M2 (Medium, FIXED) — the arm the change *creates* had no unit coverage
 
-- `uv run pytest tests/unit/test_eumemic_bot_review.py -q` → **69 passed**
-- `uv run ruff check` / `ruff format --check` on the two changed Python files → clean
-- `uv run mypy scripts/eumemic_bot_review.py` → clean
+TCP-first removes the observed race (UDP picks a port, TCP `start_server`
+dies on it — exactly the `('0.0.0.0', 56370)` shape in the CI log, since
+asyncio's `create_server` re-raises the bind `OSError` with the resolved
+address in the message and the errno preserved). It moves the race to the
+other side: TCP wins a port whose UDP half is already held, so the **UDP
+attach** is the new `EADDRINUSE` site and its retry must also unwind the TCP
+server it already bound. The committed
+`test_eaddrinuse_retries_on_a_new_ephemeral_port` forces the *TCP* bind onto a
+live listener, so it never exercises that arm.
 
-## Non-blocking notes
+Verified manually that the arm is correct (forcing the first `SOCK_DGRAM`
+bind to raise `EADDRINUSE`): the resolver retries, answers the sentinel over
+UDP, accepts TCP **on the same port**, and `/proc/self/fd` is back to its
+pre-start count after `stop()` (7 → 7, no leaked TCP listener). Added
+`test_eaddrinuse_on_the_udp_attach_retries` so a future edit cannot break it
+silently. (Passes on the committed tip too — it is coverage, not a bug fix.)
 
-1. **The next dir of the same class is the agent home, not the checkout.** The opener is
-   applied to `os.getcwd()` only. `agent_home` lives under `tempfile.gettempdir()`, which
-   is reachable today purely because ubuntu-latest leaves `TMPDIR` unset and `/tmp` is
-   `1777`. Set `TMPDIR` to anything `0700` (or point it at `$HOME`) and the dropped uid
-   loses its own `gitconfig`/`harness-spec.json` again — the exact defect of round
-   `botpost2410t`, in a new disguise. It would fail closed and loudly, so it is not a
-   blocker, but calling `_ensure_dropped_uid_can_enter(root.parent)` (or asserting
-   traversability of the temp root's ancestors) would retire the class rather than the
-   instance.
-2. **The walk widens `0600` files inside the checkout to world-readable.** Verified:
-   a tracked `0600` `cfg.ini` became readable to the dropped agent. Harmless in this
-   workflow — the only thing in `$GITHUB_WORKSPACE` before the agent step is
-   `actions/checkout` output with `persist-credentials: false` — but it means any future
-   step that stages a secret into the workspace hands it to an untrusted agent. Scoping
-   the read-widening to `.git` plus `git ls-files` output would keep the property the
-   digest needs without the sharp edge.
-3. **Two mechanisms for one job.** `_make_tree_readable` (`:421`, one `sudo chmod -R
-   a+rX`) and the new per-entry Python walk do the same thing by different means.
-   Per CLAUDE.md's "compose, don't accrete", one of them should be the primitive.
-4. **`_chmod_add` `_die`s when `stat` fails mid-walk** (`:434`), turning a benign
-   file-vanished race into a FATAL. `os.walk` over a live tree can hand out entries that
-   are already gone; skipping `FileNotFoundError` would be strictly better.
-5. **The new unit test mutates directories outside `tmp_path`.** Because the opener walks
-   to `/`, `test_ensure_dropped_uid_can_enter_opens_a_0700_home` left `/tmp/pytest-of-box`
-   and `/tmp/pytest-of-box/pytest-17{2,3}` at `0711` on this box (earlier `pytest-171` is
-   still `0700`). Harmless, but a unit test should not chmod its way up the filesystem —
-   an explicit stop boundary on the ancestor walk would fix both this and note 1.
-6. **Still no test that performs a real drop.** `test_run_agent_opens_the_checkout_before_
-   the_dropped_diff` stubs `_drop_into_agent_user`, `_ensure_dropped_uid_can_enter` and
-   `_verify_dropped_diff` and asserts call *order* — useful, and still not reachability.
-   `test_ensure_dropped_uid_can_enter_opens_a_0700_home` is the first test in this family
-   that asserts real modes, which is the right direction. A skip-if-unavailable test that
-   does a real `setpriv` drop and asserts the dropped uid can `cat` its own
-   `harness-spec.json` and reproduce the digest would have caught all three blockers of
-   the last three rounds; this review has had to supply that out-of-tree every time.
-7. Prior-round notes 1–3 stand: the self-check still gates on the stringly
-   `"setpriv" in command` (`:986`) with `base_sha`/`head_sha` defaulted to `""`, so a
-   caller that forgets the kwargs silently skips the fail-closed check;
-   `_agent_gitconfig_text` still does not escape git-config value syntax; and
-   `diff_evidence` (launcher env/global config) vs `_verify_dropped_diff`
-   (`env -i … LANG=C`, different `GIT_CONFIG_GLOBAL`) still compute the digest under
-   different config postures. All three matched live here.
+### L1 (Low, note) — retry logs `credential_dns.stopped port=None`
 
-## Verdict
+Every failed attempt calls `stop()`, which emits a `credential_dns.stopped`
+line with `port=None` (and, after M1's stale-`_port` case, the *previous*
+port). Harmless log noise; left alone rather than widening the diff.
 
-**PASS.** This is the first tip in the series where a review can actually complete: the
-dropped `eumemic-review` uid enters a `0700`-ancestor checkout, reproduces the launcher's
-digest byte-for-byte, and the artifact comes back with exit 0 — while the heading-only
-harness still exits 3 with no artifact, `$HOME` stays unlistable, the agent still cannot
-sudo or read the key-holder's `/proc`, the temp tree tears down cleanly, and the digest is
-provably unperturbed by the chmod walk. The fix is also the right *shape*: it opens every
-ancestor instead of betting on which one was `0700`. The remaining notes are hardening,
-not blockers.
+### L2 (Low, note, pre-existing) — `CancelledError` becomes `CredentialDnsError`
+
+`except BaseException` in `start()` converts a cancellation into a domain
+error. Unchanged by this tip (the pre-tip code did the same) and it still
+fails closed, so it is out of scope here.
+
+### L3 (Low, note) — `assert sockets` in `_bind()` is stripped under `-O`
+
+`assert sockets, "asyncio.start_server returned no sockets"` is the repo's
+existing idiom (cf. the `port` property), so consistent; noting only that it
+is not a runtime guarantee.
+
+---
+
+## Requirement-by-requirement
+
+| # | Requirement | Result |
+|---|---|---|
+| 1 | Dual-protocol bind no longer fails closed on parallel-e2e `EADDRINUSE` | **PASS** — TCP `start_server(0)` first, UDP attached to the returned port, bounded 16-attempt retry on a fresh pair for either side. Both directions verified (committed test forces the TCP side; added test forces the UDP attach). |
+| 2 | Two sessions must not share a resolver; one `dns_port` for udp/53 + tcp/53 | **PASS** — neither socket sets `SO_REUSEADDR`/`SO_REUSEPORT` explicitly; asyncio's `create_server` sets `SO_REUSEADDR` implicitly on POSIX (pre-existing, unchanged) and Linux does **not** let that bind over a socket in `LISTEN`. Empirically: 6 concurrent resolvers get 6 distinct ports, and a third-party `SO_REUSEADDR` bind onto a live resolver's port is refused with errno 98 on **both** TCP and UDP. DNAT still uses a single `dns_port` for `udp/53` + `tcp/53` (`setup.py:704-705`, `718-720`), so the shared-port constraint is real and is preserved. |
+| 3 | Non-`EADDRINUSE` bind errors still fail closed | **PASS** — errno-gated: anything else raises `CredentialDnsError` on the first attempt (no 16× burn). Covered by the pre-existing `test_bind_failure_raises_credential_dns_error` (`OSError("no sockets today")`, errno `None`). Exhausted retries also fail closed (`test_persistent_eaddrinuse_still_fails_closed`). |
+| 4 | Create-time `SizeRw` baseline + e2e runtime threading from `e28d3c39` intact | **PASS** — `git diff e28d3c39..HEAD` touches only `credential_dns.py`, its test, and `REVIEW.md`; no snapshot/backend file changed. `tests/unit/sandbox/test_snapshot_verb.py` green in the run below. |
+| 5 | Focused unit coverage for the bind/retry path | **PASS after M2** — `tests/unit/sandbox/test_credential_dns.py`: retry-on-busy-TCP-port, persistent-`EADDRINUSE` fail-closed (committed) + UDP-attach retry and stale-port regression (added). |
+| 6 | Commit message / diff match the claimed rationale | **PASS** — TCP-first, shared port because of the single `dns_port` DNAT, no `SO_REUSE*`, bounded retry, other errnos fail closed: every claim is in the diff, and the cited CI signature matches the failure asyncio actually produces for a UDP-first bind. |
+
+## Checks run (focused; no full suite, no `-n`)
+
+```
+uv run pytest tests/unit/sandbox tests/unit/test_networking.py -q -p no:randomly
+  -> 780 passed
+uv run mypy src/aios/sandbox/credential_dns.py tests/unit/sandbox/test_credential_dns.py
+  -> Success: no issues found in 2 source files
+uv run ruff check / ruff format --check (both files)   -> clean
+```
+
+Docker e2e not run here (light review). The remaining e2e risk is the one this
+change cannot remove: `_BIND_ATTEMPTS = 16` fresh ephemeral pairs is a bound,
+not a guarantee, under genuine port-space exhaustion — correct behaviour is
+still a failed provision, which is what the e2e would report.
+
+## Leftovers for the Shepherd
+
+- M1 + M2 are **fixed in this worktree** on `gvisfloor3rev` (product +
+  tests); not pushed, not merged, no PR opened.
+- L1-L3 are notes only; no action taken.
+- `TASK.md` in the working tree is this round's brief (written by the
+  Shepherd after the tip was committed) and is left unstaged.

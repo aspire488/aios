@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from aios.config import get_settings
 from aios.models.environments import UnrestrictedNetworking
 from aios.sandbox.backends.base import (
     BASE_IMAGE_LABEL_KEY,
@@ -74,6 +75,7 @@ def _spec(
         image=IMAGE,
         snapshot_image=snapshot_image,
         seccomp_profile=SECCOMP_PROFILE,
+        runtime=get_settings().sandbox_runtime,
     )
 
 
@@ -160,8 +162,14 @@ async def test_filesystem_persists_processes_and_shm_do_not(
 async def test_zero_write_release_is_skipped_empty(
     daemon: tuple[DockerBackend, str, str, Path],
 ) -> None:
-    """A read/chat-only session (no writes) snapshots as ``skipped_empty`` — the
-    containerd-store SizeRw floor (a no-write container reports 4096, not 0)."""
+    """A read/chat-only session (no writes) snapshots as ``skipped_empty``.
+
+    Identity is ``SizeRw - create-time baseline`` against the default 8 KiB
+    floor, so the gate applies under runc and runsc alike — including the
+    containerd-snapshotter copy-up the gVisor job enables (Actions 35146073686
+    committed at an absolute floor of 8192 because this spec used to omit
+    ``runtime=`` and never subtracted the empty layer).
+    """
     backend, instance_id, session_id, workspace = daemon
     tag = snapshot_tag(instance_id, session_id)
 
@@ -174,7 +182,10 @@ async def test_zero_write_release_is_skipped_empty(
     )
     await backend.destroy(h1)
     assert out.kind == "skipped_empty", (
-        f"a no-write release must be skipped_empty on the floor, got {out.kind}"
+        f"a no-write release must be skipped_empty "
+        f"(runtime={get_settings().sandbox_runtime!r}, "
+        f"baseline={h1.snapshot_baseline_bytes}, "
+        f"unique_bytes={out.unique_bytes}), got {out.kind}"
     )
 
 
