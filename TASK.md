@@ -1,34 +1,27 @@
-# Fixround: #2422 name-based interception breaks lockdown/DNAT verify on CI
+# aios#2410 — botpost2410l: real credential-swap / DNAT fix (hosts vs DNS)
 
-PR: https://github.com/eumemic/aios/pull/2422
-Branch: `trigswap2` tip `45a054aa`
-Failing run: https://github.com/eumemic/aios/actions/runs/34699377660 (e2e docker)
+## Context
+Prior tip `e07df125` on `gvisorgrn` / https://github.com/eumemic/aios/pull/2410 is a FAIL review docs-only tip. Prior j-round `d27c242d` only landed `persist-credentials: false`. Zero Python changed for the DNAT/swap regression.
 
-## Root errors (empty recorder / KeyError stdout are symptoms of provision abort)
-1. Limited: `SandboxBackendError: network lockdown verification failed … OUTPUT policy is not DROP after apply`
-2. Unrestricted: `SandboxBackendError: secret-egress DNAT verification failed … nat OUTPUT carries no DNAT rule after apply`
+CI e2e(docker) still RED: `nat OUTPUT carries no DNAT rule after apply` + six credential-swap / placeholder failures (run `34919782033`).
 
-FAILED tests include:
-- test_trigger_swap_fires_under_limited / unrestricted_dnat_only
-- test_run_swap_fires_under_limited / unrestricted_dnat_only
-- test_run_bash_env_var_placeholder_round_trip
-- test_placeholder_visible_in_container_secret_absent
+## Root cause (Opus, pinned)
+`9b246ab7` replaced `getent` with `busybox nslookup`, which is DNS-only and never reads `/etc/hosts`. In the e2e host-gateway shape, `aios-worker` exists only via `--add-host`, so `PROXY_IP` is empty, the DNAT block is skipped, apply still exits 0, and verify fails.
+Bisect: `e10f4e07` swap family green; `2e0225cc` red.
 
-Leave #2421 closed. Do not reopen IPv6/`-4` as the master clear.
+## Chosen fix shape (Shepherd: smallest / restore green)
+**Shape 1:** Restore NSS/hosts-file lookup in `resolve_ipv4` (hosts first, then busybox nslookup). Return to e10f4e07-green behaviour. Document tenant-writable hosts caveats in comments if relevant.
+Do **not** do shape 2 (IP injection redesign) unless shape 1 is clearly wrong after inspection.
 
-## Goal
-Make name-based credential interception (#2042 rebase) actually apply + verify on CI so Limited DROP and Unrestricted/Limited DNAT chokepoint rules land. Both trigger-swap legs AND the run-origin placeholder/swap e2e must go green.
-
-## Investigate
-- Why does `apply_network_lockdown` / `apply_secret_egress_dnat` leave filter OUTPUT not DROP or nat without DNAT? (apply script abort early — proxy alias resolve miss, `dns_port` missing, iptables backend, `-I` DNS DNAT vs Docker 127.0.0.11, sentinel `169.254.53.53` conflicting with link-local/metadata rules, verify grep mismatch vs `iptables -S` output, credential_dns not bound so provision refuses incorrectly, etc.)
-- Prefer fixing the product apply/verify path so the chokepoint is real; do not weaken fail-closed verification.
-- Rebase onto latest origin/master if behind; push is Shepherd’s job.
-
-## Constraints
-- No Track G / Coolify / merge / push
-- PR-only; continue on `trigswap2` (update #2422)
-- Docker may be absent locally — unit tests for script generation + any integration you can run; CI is oracle for docker e2e
-- DONE.md with evidence-backed root cause of the verify failure
+## Also
+- Move DNS oracles into sidecar-after-flush / netns-joining context if still asserting the wrong context.
+- Rebase onto `origin/gvisorgrn` tip (or master if needed) before work; keep #2410 branch `gvisorgrn`.
+- Write a **true** DONE.md for this round (not stale botpost2410i).
+- Do not push; Shepherd pushes.
+- Uncorrelated review required before PR update.
 
 ## Success
-New tip on #2422 expected to clear the lockdown/DNAT verify failures and the listed e2e tests.
+- Python/product change that makes proxy alias resolve when only in `/etc/hosts` (or `--add-host`).
+- DNAT rules land after apply (no empty PROXY_IP skip).
+- Local unit coverage for hosts-first resolve if feasible.
+- DONE.md accurate.
