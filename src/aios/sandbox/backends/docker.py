@@ -54,7 +54,11 @@ from aios.sandbox.backends.base import (
     SnapshotOutcome,
     split_label_list,
 )
-from aios.sandbox.network import SANDBOX_NETWORK_NAME
+from aios.sandbox.network import (
+    SANDBOX_NETWORK_NAME,
+    WORKER_NETWORK_ALIAS,
+    resolve_network_alias_ipv4,
+)
 
 log = get_logger("aios.sandbox.backends.docker")
 
@@ -90,9 +94,26 @@ def writable_layer_delta(size_rw: int, baseline_bytes: int) -> int:
     """Tenant-authored writable-layer bytes: ``SizeRw`` minus create-time baseline.
 
     Negative deltas (SizeRw shrank — rare) clamp to 0 so they still short-circuit
-    as empty rather than commit a "negative write".
+    as empty rather than commit a "negative write". SizeRw-only identity is not
+    enough under runsc: create-time SizeRw can overshoot the stopped corpse
+    (gVisor self-overlay filestore, ``type=image`` operator mount), so a 64 KiB
+    tenant write still looks empty. :func:`writable_layer_diff_paths` is the veto.
     """
     return max(0, size_rw - baseline_bytes)
+
+
+def writable_layer_diff_paths(diff_output: str) -> frozenset[str]:
+    """Parse ``docker diff`` into the set of changed paths.
+
+    Each line is ``<status><space><path>`` with status ``A``/``C``/``D``. Anything
+    else is ignored (banner, blank). Used as the create-time identity stamp so a
+    SizeRw-baseline overshoot cannot skip a layer that grew new files.
+    """
+    paths: set[str] = set()
+    for line in diff_output.splitlines():
+        if len(line) >= 3 and line[0] in "ACD" and line[1] == " ":
+            paths.add(line[2:])
+    return frozenset(paths)
 
 
 # A runsc sandbox's netfilter lives in its Sentry, not in the Linux network
@@ -330,6 +351,7 @@ class DockerBackend:
     def __init__(self) -> None:
         self._snapshot_timeout_attempts: dict[str, int] = {}
         self._snapshot_baselines: dict[str, int] = {}
+        self._snapshot_diff_baselines: dict[str, frozenset[str]] = {}
 
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
         """Run ``docker run`` per ``spec`` and return a handle to the started container."""
@@ -362,13 +384,42 @@ class DockerBackend:
         for key, value in spec.labels.items():
             argv.extend(["--label", f"{key}={value}"])
 
-        argv.extend(["--network", spec.network_name or SANDBOX_NETWORK_NAME])
+        network_name = spec.network_name or SANDBOX_NETWORK_NAME
+        argv.extend(["--network", network_name])
 
         if spec.runtime == "runsc":
+            # Fail closed on a tenant-supplied image BEFORE any daemon call.
+            operator_image = _runsc_operator_image(spec)
+            # A runsc sandbox cannot use Docker's embedded DNS at all: that
+            # resolver lives on 127.0.0.11 in the netns, reached through
+            # netfilter rules the Sentry never replays (google/gvisor#7469),
+            # so ``aios-worker`` does not resolve inside gVisor and
+            # ``--dns`` cannot fix it (on a user-defined network Docker keeps
+            # 127.0.0.11 as the container's nameserver and treats ``--dns``
+            # as that resolver's upstream). Bake the alias into /etc/hosts
+            # instead, which libc reads first and runsc passes through.
+            # ``host_gateway_alias`` is the worker-on-host shape, which is
+            # already hosts-based and whose worker is not on this network.
+            if spec.host_gateway_alias is None:
+                worker_address = await resolve_network_alias_ipv4(
+                    WORKER_NETWORK_ALIAS, network_name
+                )
+                if worker_address is None:
+                    # No worker on this network to name. Not fatal here: a
+                    # sandbox that needs the broker fails loudly when it
+                    # reaches for it, and provisioning's own resolve of the
+                    # proxy alias is already a hard error (#2042).
+                    log.warning(
+                        "sandbox.runsc_worker_alias_unresolved",
+                        network=network_name,
+                        alias=WORKER_NETWORK_ALIAS,
+                    )
+                else:
+                    argv.extend(["--add-host", f"{WORKER_NETWORK_ALIAS}:{worker_address}"])
             argv.extend(
                 [
                     "--mount",
-                    f"type=image,src={_runsc_operator_image(spec)},dst={_RUNSC_OPERATOR_ROOT}",
+                    f"type=image,src={operator_image},dst={_RUNSC_OPERATOR_ROOT}",
                 ]
             )
 
@@ -504,6 +555,9 @@ class DockerBackend:
         baseline = await self._stamp_snapshot_baseline(container_id)
         if baseline is not None:
             self._snapshot_baselines[container_id] = baseline
+        diff_paths = await self._inspect_container_diff_paths(container_id)
+        if diff_paths is not None:
+            self._snapshot_diff_baselines[container_id] = diff_paths
 
         return SandboxHandle(
             owner_id=spec.session_id,
@@ -576,6 +630,7 @@ class DockerBackend:
     async def destroy(self, handle: SandboxHandle) -> None:
         """``docker rm --force`` the container. No-op if already gone."""
         self._snapshot_baselines.pop(handle.sandbox_id, None)
+        self._snapshot_diff_baselines.pop(handle.sandbox_id, None)
         argv = ["docker", "rm", "--force", handle.sandbox_id]
         try:
             rc, _, stderr_bytes = await run_docker_cli(argv)
@@ -675,6 +730,7 @@ class DockerBackend:
     async def force_remove(self, sandbox_id: str) -> None:
         """``docker rm --force`` a container by id. Logs but does not raise."""
         self._snapshot_baselines.pop(sandbox_id, None)
+        self._snapshot_diff_baselines.pop(sandbox_id, None)
         argv = ["docker", "rm", "--force", sandbox_id]
         try:
             rc, _, stderr_bytes = await run_docker_cli(argv)
@@ -887,8 +943,24 @@ class DockerBackend:
         #    create-time baseline, so the discard window stays one page of
         #    tenant writes regardless of store or runtime. Unstamped corpses
         #    (other process, pre-upgrade) use baseline 0 (fail closed: commit).
+        #
+        #    SizeRw-delta is necessary but not sufficient. gVisor's default
+        #    rootfs overlay (and the runsc ``type=image`` operator mount)
+        #    can make create-time SizeRw *overshoot* the stopped corpse, so a
+        #    64 KiB ``/root/blob`` still has delta 0. A create-time ``docker
+        #    diff`` stamp vetoes skip-empty when new paths appeared — fail
+        #    closed (commit) if the diff cannot be read back.
         baseline = self._snapshot_baselines.get(sandbox_id, 0)
-        if size_rw is not None and writable_layer_delta(size_rw, baseline) <= empty_floor_bytes:
+        size_is_empty = (
+            size_rw is not None and writable_layer_delta(size_rw, baseline) <= empty_floor_bytes
+        )
+        if size_is_empty:
+            created_paths = self._snapshot_diff_baselines.get(sandbox_id)
+            if created_paths is not None:
+                current_paths = await self._inspect_container_diff_paths(sandbox_id)
+                if current_paths is None or current_paths - created_paths:
+                    size_is_empty = False
+        if size_is_empty:
             if tag_fields is None:
                 return SnapshotOutcome(kind="skipped_empty", image_id=None, unique_bytes=0, depth=0)
             return SnapshotOutcome(
@@ -1571,6 +1643,26 @@ class DockerBackend:
                 error=str(err),
             )
             return None
+
+    async def _inspect_container_diff_paths(self, sandbox_id: str) -> frozenset[str] | None:
+        """Return the ``docker diff`` path set, or ``None`` if the probe failed."""
+        try:
+            rc, stdout_bytes, stderr_bytes = await run_docker_cli(["docker", "diff", sandbox_id])
+        except SandboxBackendError as err:
+            log.warning(
+                "sandbox.snapshot_diff_inspect_failed",
+                container_id=sandbox_id[:12],
+                error=str(err),
+            )
+            return None
+        if rc != 0:
+            log.warning(
+                "sandbox.snapshot_diff_inspect_failed",
+                container_id=sandbox_id[:12],
+                error=stderr_bytes.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+        return writable_layer_diff_paths(stdout_bytes.decode("utf-8", errors="replace"))
 
     async def _inspect_image_fields(self, ref: str) -> tuple[str, int, int, dict[str, str]] | None:
         """Return ``(image_id, size_bytes, layer_depth, labels)`` or ``None`` if absent.

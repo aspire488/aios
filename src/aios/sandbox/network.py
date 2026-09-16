@@ -2,16 +2,22 @@
 
 Two in-netns resolution paths share one hostname (``aios-worker``): Docker's
 embedded DNS when the worker is on the sandbox network, and ``/etc/hosts``
-populated by ``--add-host`` when the worker runs on the host. A third path
-lives on the worker itself: :func:`resolve_host_gateway` turns the daemon's
-``host-gateway`` substitution into an address the egress scripts can bake in,
-so neither sidecar shape has to look that alias up inside the netns.
+populated by ``--add-host`` when the worker runs on the host. A gVisor sandbox
+has only the second: its Sentry never sees the netns netfilter rules that make
+``127.0.0.11`` answer, so :func:`resolve_network_alias_ipv4` turns the
+worker's alias into an address ``--add-host`` can bake in there too.
+
+Both of those lookups happen on the worker: :func:`resolve_host_gateway` turns
+the daemon's ``host-gateway`` substitution into an address the egress scripts
+can bake in, so neither sidecar shape has to look that alias up inside the
+netns.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
 from pathlib import Path
 
@@ -123,6 +129,75 @@ async def _probe_host_gateway() -> str:
         f"host-gateway probe wrote no {_HOST_GATEWAY_PROBE_ALIAS!r} entry; this "
         "Docker daemon does not support --add-host <name>:host-gateway"
     )
+
+
+async def resolve_network_alias_ipv4(alias: str, network: str = SANDBOX_NETWORK_NAME) -> str | None:
+    """The IPv4 address publishing ``alias`` on ``network``, or ``None``.
+
+    Resolved HERE, on the worker, by reading the endpoints Docker itself
+    recorded — never by asking a resolver inside the sandbox netns.
+
+    This exists for runsc. Docker publishes a network alias only through its
+    embedded DNS server, which libnetwork binds on ``127.0.0.11`` **inside the
+    container's netns** and reaches through netfilter rules installed in that
+    same netns. A gVisor sandbox terminates its own traffic in the Sentry's
+    netstack and never replays those rules (google/gvisor#7469), so the alias
+    is unresolvable from inside a runsc sandbox no matter what its
+    ``resolv.conf`` says. ``--dns`` does not move that: on a user-defined
+    network Docker always writes ``127.0.0.11`` as the container's only
+    nameserver and treats ``--dns`` as the embedded resolver's *upstream*
+    forwarder. The address is therefore baked into ``/etc/hosts`` at create
+    (``--add-host``), which libc consults before DNS and which runsc passes
+    through as the ordinary bind mount it is — the same hosts-first shape the
+    worker-on-host path already uses (:func:`resolve_host_gateway`) and the
+    egress scripts already resolve through (``aios.sandbox.setup``).
+
+    ``None`` means no running container on ``network`` claims ``alias`` — the
+    caller keeps the DNS-only behavior rather than inventing an address.
+    """
+    rc, stdout_bytes, stderr_bytes = await run_docker_cli(
+        ["docker", "ps", "--quiet", "--no-trunc", "--filter", f"network={network}"]
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"listing containers on network {network!r} failed (exit {rc}): "
+            f"{stderr_bytes.decode('utf-8', errors='replace').strip()}"
+        )
+    container_ids = stdout_bytes.decode("utf-8", errors="replace").split()
+    if not container_ids:
+        return None
+
+    # ``{{json .NetworkSettings.Networks}}`` — the whole endpoint map as JSON,
+    # not per-field templating: Docker's inspect templates run under
+    # ``missingkey=error``, so naming a key a record does not carry kills the
+    # template for that container and silently drops it from stdout. A batch
+    # containing a container that exited between the two calls exits nonzero
+    # but still writes the lines it did produce, so parse what came back.
+    rc, stdout_bytes, _ = await run_docker_cli(
+        ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", *container_ids]
+    )
+    for line in stdout_bytes.decode("utf-8", errors="replace").splitlines():
+        try:
+            networks = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(networks, dict):
+            continue
+        endpoint = networks.get(network)
+        if not isinstance(endpoint, dict):
+            continue
+        # ``Aliases`` is the classic field; ``DNSNames`` is what Engine 25+
+        # records. Either one is how Docker's own resolver answers the name.
+        names = [*(endpoint.get("Aliases") or []), *(endpoint.get("DNSNames") or [])]
+        if alias not in names:
+            continue
+        try:
+            address = str(ipaddress.IPv4Address(str(endpoint.get("IPAddress") or "")))
+        except ValueError:
+            continue
+        log.info("sandbox.network_alias_resolved", network=network, alias=alias, address=address)
+        return address
+    return None
 
 
 async def ensure_sandbox_network() -> None:
@@ -330,4 +405,5 @@ __all__ = [
     "ensure_sandbox_network",
     "is_running_in_container",
     "resolve_host_gateway",
+    "resolve_network_alias_ipv4",
 ]
