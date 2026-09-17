@@ -21,9 +21,11 @@ expected to run arbitrary shell inside the sandbox.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import platform
 import shutil
+import tempfile
 from pathlib import Path
 from time import monotonic
 
@@ -167,6 +169,72 @@ def _require_runsc_supported_machine(what: str) -> None:
             f"the operator image is entered through {_RUNSC_OPERATOR_LOADER}, which "
             "exists only in its x86_64 build"
         )
+
+
+@functools.cache
+def _runsc_seccomp_profile(source: str) -> str:
+    """Derive a runsc-safe copy of *source* that lets python/node threads start.
+
+    gVisor's OCI seccomp translator (``runsc/specutils/seccomp``) pins every
+    ``SCMP_ACT_ERRNO`` to EPERM — ``errnoAction`` is a package-level constant
+    and ``ErrnoRet`` is never read. The vendored clone3 rule is ENOSYS (38)
+    precisely so glibc/libuv fall back to the arg-filtered clone; under runsc
+    it arrives as EPERM, which is NOT a fallback trigger, so pthread_create
+    fails and Node aborts in ``uv_thread_create`` (exit 134). ENOSYS cannot be
+    expressed through OCI seccomp under runsc at all, so the only way to give
+    the thread path back is ALLOW.
+
+    ACCEPTED RISK, stated plainly because the alternative is a security claim
+    that is not true: the ALLOW is unfiltered and has to be — clone3 takes its
+    flags in a ``struct clone_args`` in user memory, which seccomp cannot read
+    (that is exactly why the vendored profile answers ENOSYS instead of
+    arg-filtering it like clone). gVisor implements clone3 natively
+    (``linux64.go``: ``PartiallySupported("clone3", Clone3, ...)``, converging
+    on the same ``Task.Clone`` as clone, which accepts ``CLONE_NEWUSER`` with
+    no capability check), so under runsc ``clone3(CLONE_NEWUSER)`` DOES create
+    a user namespace. ``test_unshare_user_namespace_denied`` covers only the
+    ``unshare`` path and stays green either way — it is not evidence for the
+    stronger claim.
+
+    What still holds under runsc: the authored #807 deny block is
+    unconditional and first-match, so mount/umount/setns/unshare/keyctl/bpf
+    stay EPERM inside any namespace a tenant creates this way; and a fresh
+    netns has no routable interface (moving one in needs CAP_NET_ADMIN in the
+    PARENT userns, which the tenant does not have), so the egress lockdown is
+    not reachable from here. runc is untouched: it honours ``ErrnoRet``, keeps
+    the ENOSYS fallback, and never sees this derived profile.
+    """
+    data: object = json.loads(Path(source).read_text())
+    if not isinstance(data, dict):
+        raise SandboxBackendError(f"seccomp profile {source} is not a JSON object")
+    syscalls = data.get("syscalls")
+    if not isinstance(syscalls, list):
+        raise SandboxBackendError(f"seccomp profile {source} has no syscalls list")
+    syscalls.insert(
+        0,
+        {
+            "names": ["clone3"],
+            "action": "SCMP_ACT_ALLOW",
+            "comment": (
+                "runsc OCI seccomp always returns EPERM for ERRNO (ignores "
+                "errnoRet 38); allow clone3 so glibc/libuv can create threads. "
+                "CLONE_NEWUSER remains denied on unshare and arg-filtered clone."
+            ),
+        },
+    )
+    with tempfile.NamedTemporaryFile(
+        prefix="aios-seccomp-runsc-", suffix=".json", mode="w", delete=False
+    ) as handle:
+        json.dump(data, handle)
+        return handle.name
+
+
+def _seccomp_opt(spec: SandboxSpec) -> str:
+    """``--security-opt seccomp=`` value. runsc gets the clone3-ALLOW derivative."""
+    profile = spec.seccomp_profile
+    if spec.runtime == "runsc" and profile != "unconfined":
+        return _runsc_seccomp_profile(profile)
+    return profile
 
 
 def _runsc_operator_image(spec: SandboxSpec) -> str:
@@ -517,7 +585,7 @@ class DockerBackend:
         # so a misconfiguration can't silently fall back to Docker's default profile.
         # The value is a host path the docker CLI reads, or the literal "unconfined"
         # (emergency rollback via AIOS_SANDBOX_SECCOMP_PROFILE only).
-        argv.extend(["--security-opt", f"seccomp={spec.seccomp_profile}"])
+        argv.extend(["--security-opt", f"seccomp={_seccomp_opt(spec)}"])
 
         if spec.runtime:
             argv.extend(["--runtime", spec.runtime])
