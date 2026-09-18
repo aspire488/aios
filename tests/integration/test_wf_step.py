@@ -109,6 +109,7 @@ async def _needing(pool: asyncpg.Pool[Any]) -> set[str]:
             await wf_queries.list_run_ids_needing_step(
                 conn,
                 agent_deadline_seconds=3600,
+                agent_cost_ceiling_microusd=0,
                 tool_stale_seconds=60,
                 bash_default_timeout_seconds=120,
                 sandbox_provisioning_slack_seconds=180,
@@ -3447,6 +3448,249 @@ async def test_agent_call_times_out_when_child_never_responds(
     assert run.output == {"timed_out": "timeout"}
     assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
     assert child.archived_at is None  # left running — responding ≠ terminating
+
+
+async def test_agent_call_resolves_when_child_exceeds_the_spend_ceiling(
+    wf_runtime: asyncpg.Pool[Any], wf_agent_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that burns past its SPEND ceiling resolves the agent() call as a
+    catchable AgentError(timeout) WITHOUT waiting out the wall-clock deadline (#2396).
+
+    The wall-clock bound cannot see this case: the call is nowhere near its 1h
+    deadline. On 2026-09-18 two review children spent ~1100 tool calls in two hours
+    while every status field read healthy and `updated_at` stayed fresh, so a
+    consumption bound is the only one that trips. Like the deadline, this writes a
+    response and does NOT terminate the child (responding != ending)."""
+    from aios.config import get_settings
+
+    pool = wf_runtime
+    get_settings.cache_clear()
+    monkeypatch.setenv("AIOS_WORKFLOW_AGENT_COST_CEILING_MICROUSD", "500000")  # $0.50
+    script = (
+        "async def main(input):\n"
+        "    try:\n"
+        f"        return await agent('go', agent_id={wf_agent_id!r})\n"
+        "    except AgentError as e:\n"
+        "        return {'stopped': e.kind}\n"
+    )
+    run_id = await _make_run(pool, script)
+    await run_workflow_step(run_id)  # spawn + suspend
+    child_id = await _child_id_of(pool, run_id)
+    rid = await _open_request_id(pool, child_id)
+
+    # Child burns past the ceiling. The call_started is NOT aged: the deadline is
+    # untouched, so a pass here can only come from the spend bound.
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 750000)
+
+    await run_workflow_step(run_id)  # harvest: over ceiling -> resolve
+
+    async with pool.acquire() as conn:
+        run = await wf_queries.get_run_for_step(conn, run_id)
+        resp = await db_queries.read_request_response(
+            conn, child_id, account_id="acc_wf", request_id=rid
+        )
+        child = await db_queries.get_session_bare(conn, child_id, account_id="acc_wf")
+    assert run is not None and run.status == "completed"
+    assert run.output == {"stopped": "timeout"}
+    assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
+    assert child.archived_at is None  # left running — responding != terminating
+    get_settings.cache_clear()
+
+
+async def test_child_under_the_spend_ceiling_is_left_alone(
+    wf_runtime: asyncpg.Pool[Any], wf_agent_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The NEGATIVE case, and the one that makes the test above mean anything: a
+    child spending real money but UNDER its ceiling stays pending and the parent
+    stays suspended. Without this, a ceiling that resolved every call — or one wired
+    to fire unconditionally — would pass the over-budget test identically."""
+    from aios.config import get_settings
+
+    pool = wf_runtime
+    get_settings.cache_clear()
+    monkeypatch.setenv("AIOS_WORKFLOW_AGENT_COST_CEILING_MICROUSD", "500000")  # $0.50
+    script = (
+        "async def main(input):\n"
+        "    try:\n"
+        f"        return await agent('go', agent_id={wf_agent_id!r})\n"
+        "    except AgentError as e:\n"
+        "        return {'stopped': e.kind}\n"
+    )
+    run_id = await _make_run(pool, script)
+    await run_workflow_step(run_id)
+    child_id = await _child_id_of(pool, run_id)
+    rid = await _open_request_id(pool, child_id)
+
+    async with pool.acquire() as conn:
+        # 499999 < 500000: one micro-dollar under. Boundary is >=, so this must NOT trip.
+        await conn.execute("UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 499999)
+
+    await run_workflow_step(run_id)  # harvest: under ceiling -> still pending
+
+    async with pool.acquire() as conn:
+        run = await wf_queries.get_run_for_step(conn, run_id)
+        resp = await db_queries.read_request_response(
+            conn, child_id, account_id="acc_wf", request_id=rid
+        )
+    assert run is not None and run.status == "suspended"  # still waiting, correctly
+    assert resp is None  # no response written — the child was not cut off
+    get_settings.cache_clear()
+
+
+async def test_spend_ceiling_disabled_by_default_leaves_a_big_spender_alone(
+    wf_runtime: asyncpg.Pool[Any], wf_agent_id: str
+) -> None:
+    """Default 0 = disabled: an enormous spend does NOT resolve the call. The knob
+    ships inert, so merging this changes no existing behaviour until an operator
+    opts in."""
+    from aios.config import get_settings
+
+    pool = wf_runtime
+    get_settings.cache_clear()
+    script = (
+        "async def main(input):\n"
+        "    try:\n"
+        f"        return await agent('go', agent_id={wf_agent_id!r})\n"
+        "    except AgentError as e:\n"
+        "        return {'stopped': e.kind}\n"
+    )
+    run_id = await _make_run(pool, script)
+    await run_workflow_step(run_id)
+    child_id = await _child_id_of(pool, run_id)
+    rid = await _open_request_id(pool, child_id)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 999_000_000
+        )
+
+    await run_workflow_step(run_id)
+
+    async with pool.acquire() as conn:
+        run = await wf_queries.get_run_for_step(conn, run_id)
+        resp = await db_queries.read_request_response(
+            conn, child_id, account_id="acc_wf", request_id=rid
+        )
+    assert run is not None and run.status == "suspended"
+    assert resp is None
+    get_settings.cache_clear()
+
+
+async def test_spend_ceiling_fires_at_exactly_the_ceiling(
+    wf_runtime: asyncpg.Pool[Any], wf_agent_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cost == ceiling trips it. This is the ONLY test that pins `>=` rather than `>`:
+    a reviewer mutated the comparison to `>` and every other case still passed, because
+    499999 is strictly under and 750000 is far over. Without this the operator boundary
+    is unspecified by the suite."""
+    from aios.config import get_settings
+
+    pool = wf_runtime
+    get_settings.cache_clear()
+    monkeypatch.setenv("AIOS_WORKFLOW_AGENT_COST_CEILING_MICROUSD", "500000")
+    script = (
+        "async def main(input):\n"
+        "    try:\n"
+        f"        return await agent('go', agent_id={wf_agent_id!r})\n"
+        "    except AgentError as e:\n"
+        "        return {'stopped': e.kind}\n"
+    )
+    run_id = await _make_run(pool, script)
+    await run_workflow_step(run_id)
+    child_id = await _child_id_of(pool, run_id)
+    rid = await _open_request_id(pool, child_id)
+
+    async with pool.acquire() as conn:
+        # EXACTLY the ceiling, not a micro-dollar over.
+        await conn.execute("UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 500000)
+
+    await run_workflow_step(run_id)
+
+    async with pool.acquire() as conn:
+        run = await wf_queries.get_run_for_step(conn, run_id)
+        resp = await db_queries.read_request_response(
+            conn, child_id, account_id="acc_wf", request_id=rid
+        )
+    assert run is not None and run.status == "completed"
+    assert run.output == {"stopped": "timeout"}
+    assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
+    get_settings.cache_clear()
+
+
+async def test_sweep_wakes_a_parent_parked_behind_an_over_ceiling_child(
+    wf_runtime: asyncpg.Pool[Any], wf_agent_id: str
+) -> None:
+    """THE load-bearing test (#2396). The ceiling in _resolve_agent_call only fires on
+    a step that actually RUNS, and a parent parked behind a burning child has no signal
+    and no other traffic to produce one — so without a spend clause in the sweep
+    predicate the ceiling is unreachable for exactly the case it exists to catch, and
+    the earlier tests pass only because they call run_workflow_step() by hand.
+
+    A reviewer found this by probing list_run_ids_needing_step directly and getting []
+    with the child at 999_000_000 microusd. This pins the fix, both directions."""
+    pool = wf_runtime
+    script = (
+        "async def main(input):\n"
+        "    try:\n"
+        f"        return await agent('go', agent_id={wf_agent_id!r})\n"
+        "    except AgentError as e:\n"
+        "        return {'stopped': e.kind}\n"
+    )
+    run_id = await _make_run(pool, script)
+    await run_workflow_step(run_id)  # spawn + suspend
+    child_id = await _child_id_of(pool, run_id)
+
+    sweep_kwargs: dict[str, Any] = dict(
+        agent_deadline_seconds=3600.0,
+        tool_stale_seconds=3600.0,
+        call_llm_stale_seconds=3600.0,
+        bash_default_timeout_seconds=120.0,
+        sandbox_provisioning_slack_seconds=60.0,
+        max_bash_timeout_seconds=3600,
+    )
+
+    async with pool.acquire() as conn:
+        # Child is burning but the ceiling is DISABLED (0): must NOT be swept. This is
+        # the negative half — a clause that matched unconditionally would pass the
+        # positive case identically.
+        await conn.execute(
+            "UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 999_000_000
+        )
+        ids = await wf_queries.list_run_ids_needing_step(
+            conn, agent_cost_ceiling_microusd=0, **sweep_kwargs
+        )
+        assert run_id not in ids  # disabled → parent stays parked
+
+        # Same child, same spend, ceiling armed BELOW it: must be swept.
+        ids = await wf_queries.list_run_ids_needing_step(
+            conn, agent_cost_ceiling_microusd=500_000, **sweep_kwargs
+        )
+        assert run_id in ids  # armed → parent woken so the harvest can resolve it
+
+        # And armed ABOVE the child's spend: not swept (it is a real threshold, not a
+        # proxy for "the ceiling is on").
+        await conn.execute(
+            "UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 100_000
+        )
+        ids = await wf_queries.list_run_ids_needing_step(
+            conn, agent_cost_ceiling_microusd=500_000, **sweep_kwargs
+        )
+        assert run_id not in ids
+
+        # EXACTLY at the ceiling: swept. This pins `>=` in the SQL, which the cases
+        # above cannot — they bracket the boundary (999_000_000 over, 100_000 under)
+        # and a reviewer's `>= -> >` mutant left all 16 spend tests passing. The two
+        # `>=` (here and in _resolve_agent_call) must agree, or a child at exactly the
+        # ceiling is woken but not resolved — a wake loop with no resolution — and
+        # nothing else in the suite would notice the drift.
+        await conn.execute(
+            "UPDATE sessions SET cost_microusd = $2 WHERE id = $1", child_id, 500_000
+        )
+        ids = await wf_queries.list_run_ids_needing_step(
+            conn, agent_cost_ceiling_microusd=500_000, **sweep_kwargs
+        )
+        assert run_id in ids
 
 
 async def test_past_deadline_child_that_already_responded_keeps_its_real_response(

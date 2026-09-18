@@ -220,9 +220,10 @@ async def _resolve_agent_call(
     started_at: datetime,
     now: datetime,
     deadline: timedelta,
+    cost_ceiling_microusd: int = 0,
 ) -> Outcome | None:
     """The outcome of one inflight ``agent()`` call, or ``None`` if it is still
-    pending and within its wall-clock deadline.
+    pending and within BOTH its wall-clock deadline and its spend ceiling.
 
     ``derive_response`` returns the child's written response or a ``child_gone``
     outcome, else ``None`` (live and unanswered). A still-pending call past its
@@ -233,14 +234,43 @@ async def _resolve_agent_call(
     archived/deleted in the derive→write window surfaces as ``child_gone`` on the
     re-derive (``write_response_if_absent`` raises ``NotFoundError`` against the gone
     row — the same graceful resolution the non-timeout harvest path gives a gone
-    child, never a crash)."""
+    child, never a crash).
+
+    ``cost_ceiling_microusd`` (0 = disabled) applies the same force-resolution when
+    the child's accumulated ``cost_microusd`` reaches the ceiling. Both bounds share
+    one exit path deliberately: the resolution semantics (exactly-once write,
+    re-derive, cancel cascade, catchable ``AgentError``) are identical, and a second
+    parallel path is a second place for that contract to drift."""
     resolved = await db_queries.derive_response(
         conn, child_id, account_id=account_id, request_id=request_id
     )
     if resolved is not None:
         return resolved
-    if now - started_at < deadline:
-        return None  # pending, within deadline
+    over_budget = False
+    if cost_ceiling_microusd > 0:
+        # The SPEND analogue of the deadline. Read the child's accumulated cost
+        # directly rather than inferring burn from age: the wall-clock bound is
+        # necessarily generous (real work takes minutes) and is therefore blind to
+        # a child that burns hard inside its time budget -- the exact 2026-09-18
+        # shape, where two children spent ~1100 tool calls in two hours while every
+        # status field read healthy and `updated_at` stayed fresh.
+        spent = await conn.fetchval(
+            "SELECT cost_microusd FROM sessions WHERE id = $1 AND account_id = $2",
+            child_id,
+            account_id,
+        )
+        # `sessions.cost_microusd` is NOT NULL DEFAULT 0, so a live row always has a
+        # number; `spent is None` means only that the row is GONE, which the re-derive
+        # below already resolves as child_gone. Hence None must not count as
+        # over-budget -- not as a fail-open policy, but because it is not a cost at all.
+        #
+        # Worth recording what this canNOT see: accounting lag shows up as a stale LOW
+        # integer (cost written after the spend), never as NULL. No null check helps
+        # there; detecting it would need a staleness signal on the cost value itself.
+        over_budget = spent is not None and spent >= cost_ceiling_microusd
+
+    if now - started_at < deadline and not over_budget:
+        return None  # pending, within BOTH bounds
     with contextlib.suppress(NotFoundError):
         async with conn.transaction():
             wrote = await db_queries.write_response_if_absent(
@@ -406,7 +436,9 @@ async def _run_workflow_step_body(
         # fast-forwards past it.
         harvested = False  # any call_result journaled this step
         now = datetime.now(UTC)
-        agent_deadline = timedelta(seconds=get_settings().workflow_agent_deadline_seconds)
+        _settings = get_settings()
+        agent_deadline = timedelta(seconds=_settings.workflow_agent_deadline_seconds)
+        agent_cost_ceiling = _settings.workflow_agent_cost_ceiling_microusd
         for call_key, cap_event in list(inflight.items()):
             cap_payload = cap_event.payload
             if cap_payload.get("capability") == "agent":
@@ -420,6 +452,7 @@ async def _run_workflow_step_body(
                     started_at=cap_event.created_at,
                     now=now,
                     deadline=agent_deadline,
+                    cost_ceiling_microusd=agent_cost_ceiling,
                 )
                 if call_outcome is None:
                     continue  # still pending, within deadline — stay suspended
