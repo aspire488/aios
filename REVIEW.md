@@ -1,146 +1,149 @@
-# REVIEW — round `gvisred3`, tip `5d94b476909f19d13358009d30f20a8ec7ec25bb`
+# Uncorrelated review — aios#2453 / `ormax2453c`
 
-Checker: claude-opus-5 (uncorrelated; implementer was grok-4.6 on `gvisred3`).
-Branch under review: `gvisred3rev` (forked from the implement tip). Base:
-`origin/master` @ `f5c22254` (#2434). Evidence:
-https://github.com/eumemic/aios/actions/runs/35161851660 — 4 failed / 372 passed.
-Not pushed, not merged, no PR opened.
+- **Tip reviewed:** `739d42b3` ("fix(harness): reserve output against the provider ceiling, not window_max")
+- **Diff range:** `a1412967..739d42b3`
+- **Branch in this worktree:** `ormax2453crev` (review fix commit `c358e6fe` on top; **not pushed**)
+- **Verdict: PASS** (with one Medium risk documented below that is upstream-data, not logic)
 
-## Verdict: **FAIL** — both mechanisms are right, two shipped claims are not.
+---
 
-The tip fixes the RED legs. It also asserts, in four places, a security
-invariant that its own change breaks, and it fixes leg (b) only for images that
-never flatten. Both are High/Medium and both are **fixed in this worktree** as
-`1a588c41` (product + tests + docs). Re-review of that commit should be short;
-the tip's own code is otherwise sound and stays as-is.
+## 1. The blocking P1 is genuinely fixed
 
-## What was verified
+`effective_window_max` no longer treats `window_max` as a total context budget.
+The removed line was:
 
-**(a) Seccomp / threads — mechanism correct.** Both upstream premises check out
-against gVisor `master`:
-
-* `runsc/specutils/seccomp/seccomp.go` pins every `SCMP_ACT_ERRNO` to a
-  package-level `errnoAction = seccomp.ReturnError.Code(uint16(unix.EPERM))`
-  and never reads `ErrnoRet` — so the vendored `clone3` ENOSYS(38) rule arrives
-  in the Sentry as EPERM, which is not a glibc/libuv fallback trigger. That is
-  the `uv_thread_create` exit-134 signature exactly.
-* An ALLOW is the *only* available repair: ENOSYS cannot be expressed through
-  OCI seccomp under runsc, and clone3's flags live in a `struct clone_args` in
-  user memory that seccomp cannot filter.
-
-`_seccomp_opt` is correctly runsc-only and passes `unconfined` through
-untouched; the derived profile puts the ALLOW ahead of the vendored ENOSYS rule,
-which is what gVisor's in-order ruleset evaluation needs. The three RED tests
-(`tests/e2e/test_sandbox_seccomp.py`) build their spec with
-`runtime=get_settings().sandbox_runtime`, so the derivation does reach them in
-the gVisor job. `test_unshare_user_namespace_denied` stays green:
-`unshare -U` still falls through the masked-eq ALLOW into the #807 deny.
-
-**(b) Snapshot residual — mechanism correct.** `runsc/boot/vfs.go` `mountTmp`
-skips its internal tmpfs on `ENOTEMPTY` (and on an explicit `/tmp` spec mount,
-which is why production's #2280 bind mount was never affected and only the
-bind-mount-free e2e spec went red). The sentinel therefore does keep `/tmp` on
-the rootfs. The image is built in-job (`docker build -t aios-sandbox:ci`), so
-the Dockerfile change lands in the same CI run — no registry-rebuild dependency.
-`Dockerfile.sandbox` is single-stage with no `VOLUME` and no later `/tmp` purge.
-
-**(3) #2434 kept.** The tip is a single commit touching six files; nothing in
-the SizeRw commit/flatten path, the `skipped_empty` identity, or the worker
-`/etc/hosts` DNS is touched. No regression by construction.
-
-**(4)/(5) Coverage and message.** Focused unit coverage exists and passes; the
-commit body matches the diff. `uv run mypy src tests` clean, `ruff check` /
-`ruff format --check` clean. Focused runs only — no full suite, no `-n`:
-`tests/unit/sandbox` + `tests/unit/test_tar_filter.py` → **724 passed**
-(683 + 41 after the fixes).
-
-## Findings
-
-### F1 — High. The clone3 ALLOW re-opens CLONE_NEWUSER under runsc; the tip says it does not.
-
-`_runsc_seccomp_profile`'s docstring: *"`CLONE_NEWUSER` stays denied: the
-authored unshare EPERM block and the arg-filtered clone ALLOW are untouched,
-and those are what `test_unshare_user_namespace_denied` exercises."* The same
-claim is in the commit message, `config.py`'s `sandbox_runtime` description and
-the design doc. It does not follow, and it is false under runsc:
-
-* gVisor implements clone3 — `linux64.go`:
-  `435: syscalls.PartiallySupported("clone3", Clone3, "Options CLONE_NEWTIME,
-  CLONE_SYSVSEM and SetTid are not supported.", nil)`. `Clone3` copies
-  `clone_args` and calls the same `t.Clone(&cloneArgs)` as legacy clone, passing
-  the flags through untouched apart from `CLONE_DETACHED`/exit-signal checks.
-* `task_clone.go` gates `CLONE_NEWUSER` on nothing but `t.IsChrooted()` — no
-  capability check (that is standard unprivileged-userns behaviour).
-* The inserted ALLOW is unfiltered, necessarily so.
-
-So a tenant in a runsc sandbox can obtain a user namespace via
-`clone3(CLONE_NEWUSER)` while the guard test, which drives only `unshare`, stays
-green. That is precisely the shape a checker exists to catch: the test that is
-supposed to prove the property is insensitive to the change that breaks it.
-
-Residual risk is bounded, and that is *why* the ALLOW is still the right call —
-the #807 deny block is unconditional and first-match, so
-`mount/umount/setns/unshare/keyctl/bpf` remain EPERM inside any namespace
-obtained this way, and a fresh netns has no routable interface (wiring one in
-needs CAP_NET_ADMIN in the **parent** userns). runc is untouched: it honours
-`ErrnoRet`, keeps ENOSYS, and never sees the derived profile.
-
-**Fixed in `1a588c41`:** the ALLOW is kept; `docker.py`, `config.py` and the
-design doc now state the hole as an accepted risk with the bounding argument,
-and `test_runsc_profile_is_the_authored_one_plus_exactly_the_clone3_allow` pins
-the derivation to *authored + exactly one rule* (plus
-`test_runsc_profile_keeps_the_unconditional_namespace_deny`) so a second hole
-cannot be added silently.
-
-### F2 — Medium. The `/tmp` sentinel does not survive flatten, so leg (b) regresses on the next cycle.
-
-`EPHEMERAL_PREFIXES` (`src/aios/sandbox/_tar_filter.py`) drops everything under
-`tmp/` from the flatten export — keeping the directory, dropping its contents,
-including `/tmp/.aios-keep`. A flattened image therefore resumes with an
-**empty** `/tmp`, `mountTmp` overlays tmpfs again, and the hidden-writes bug is
-back. The design-doc sentence the tip added ("`/tmp` stays on the rootfs and
-snapshot/resume keeps `/tmp/marker`") is true only until the first flatten. The
-RED test passes because it pins `flatten_if_unique_bytes_over=None`, so CI would
-not have caught the gap.
-
-**Fixed in `1a588c41`:** `KEPT_PATHS = {"tmp/.aios-keep"}` carves the sentinel
-out of `_is_ephemeral`, with `TestGvisorSentinel` asserting it survives while
-its siblings are dropped and that it matches the Dockerfile that plants it. The
-sentinel is zero bytes, so the `_ephemeral_bytes` flatten-gate estimate is
-unaffected in any meaningful way.
-
-### F3 — Low (note only). Derived-profile temp file is never cleaned up.
-
-`_runsc_seccomp_profile` writes a `NamedTemporaryFile(delete=False)` and is
-`functools.cache`d on the source path: one leaked file per profile path per
-worker process (bounded, but never removed), and an edit to the authored profile
-inside a live process is not picked up. A missing/unreadable profile now raises a
-bare `OSError` out of `create()` rather than the `SandboxBackendError` its
-siblings raise two lines below — it still fails hard, just with a less
-recognisable error. Left as-is.
-
-### F4 — Low (note only). The ALLOW is inserted at index 0, ahead of the authored #807 deny block.
-
-Harmless today — the deny block deliberately excludes `clone`/`clone3` — but if
-`clone3` were ever added there, the runsc copy would silently override it rather
-than failing loudly. Inserting immediately after the authored deny block instead
-of at the head would make that a loud CI failure. The new
-authored-plus-exactly-one-rule test narrows the blast radius; the insertion point
-is unchanged.
-
-### F5 — Low (note only). A tenant can delete the sentinel.
-
-`/tmp/.aios-keep` is root-owned `644` in a sandbox whose agent runs as root. A
-session that removes it *and* empties `/tmp` gets the tmpfs overlay back on the
-next resume. Self-inflicted and not worth a guard; noted for the record.
-
-## Reproduction commands
-
-```
-uv run pytest tests/unit/sandbox tests/unit/test_tar_filter.py -q   # 724 passed
-uv run mypy src tests                                               # clean
-uv run ruff check src tests && uv run ruff format --check src tests # clean
+```python
+input_cap = window_max if output_reserve is None else max(1, window_max - reservation)
 ```
 
-No docker/gVisor e2e was run here (per brief). The e2e verdict still rests on
-the next gVisor Validation run.
+and the unknown-ceiling branch now returns `max(1, int(window_max * shrink_factor))`.
+The reservation is subtracted only from a ceiling, via `min(window_max, max(1, ceiling - reservation))`,
+where `ceiling = served_ceiling(model) or context_limit`.
+
+Verified against the live LiteLLM catalog with `window_max=150_000` (the model default,
+`src/aios/models/agents.py:1039`):
+
+| model | reserve | limit | budget @739d42b3 | budget @a1412967 |
+|---|---|---|---|---|
+| `anthropic/claude-opus-4-5` | 64000 | 200000 | **136000** | 86000 |
+| `anthropic/claude-opus-4-6` | 128000 | 1000000 | **150000** | 22000 |
+| `anthropic/claude-opus-4-1` | 32000 | 200000 | **150000** | 118000 |
+| `openai/gpt-4.1` | None | None | 150000 | 150000 |
+| `openrouter/anthropic/claude-opus-4-1` | 0 | None | 200000 | 200000 |
+
+`claude-opus-4-5` lands on exactly the `min(150000, 200000-64000) = 136000` the brief specifies.
+`claude-opus-4-6` — the repo's own canonical model (`src/aios/cli/commands/init.py:38`,
+`src/aios/models/agents.py:1006`) — was the worst case of the P1: a **22k** usable input
+window. It is now 150000.
+
+## 2. Checklist walkthrough
+
+1. **No `window_max - reserve`.** Confirmed, line removed; the only subtraction is `ceiling - reservation`. ✔
+2. **Known ceiling ⇒ `min(window_max, ceiling - reserve)`.** `context_budget.py:81`. ✔
+3. **Unknown ceiling ⇒ `window_max` preserved.** `context_budget.py:80`. The ceiling comes from
+   existing catalog helpers (`litellm.get_model_info` → `max_input_tokens`), mirroring
+   `default_max_output_tokens` exactly — same source, same `@cache`, same `None`-is-a-real-answer
+   stance. No invented map. ✔
+4. **OpenRouter unchanged.** `resolved_context_limit` is gated on `_uses_anthropic_max_tokens_default`,
+   which already excludes both the `openrouter/` prefix and `custom_llm_provider="openrouter"`,
+   so OpenRouter resolves `limit=None` and keeps its `window_max`-only budget. Reservation
+   behavior untouched. ✔
+5. **Wire injection / caller precedence intact.** `_apply_default_max_tokens`,
+   `_normalize_explicit_output_cap` and `resolved_output_reservation` are unmodified in this
+   diff; `tests/unit/test_completion_max_tokens.py` (incl. the real-LiteLLM wire-body test)
+   passes untouched. Explicit `max_tokens` / `max_output_tokens` still win
+   (`limit - 1234` asserted for both spellings). ✔
+6. **Test coverage.** Good, and notably the tests now assert *relative* to the resolvers rather
+   than pinning catalog literals — correct, since unit tests run egress-blocked against the
+   bundled backup map while production fetches the live map, and the two disagree. One real
+   gap found and closed (§3). ✔
+7. **Ruff / mypy clean.** ✔
+
+**Gate agreement (checked, since a drift here is silent):** `resolved_output_reservation` and
+`resolved_context_limit` return non-`None` on exactly the same routes, because both funnel
+through `_uses_anthropic_max_tokens_default` / the `CacheChannel.ANTHROPIC` gate and both read
+the *same* `get_model_info` entry. A model LiteLLM cannot resolve yields `None` from both, so
+there is no "reserve against a limit that doesn't exist" state.
+
+## 3. Finding — test gap on the exact changed branch (Medium) — **FIXED** in `c358e6fe`
+
+739d42b3 changed precisely one branch: positive `output_reserve` + unknown ceiling. **Nothing
+in the suite covered that combination.** Every Anthropic test resolves a ceiling, and both
+OpenRouter tests resolve a *zero* reservation — and `window_max - 0 == window_max`, so
+reinstating `max(1, window_max - reservation)` would have left the entire file green. Given
+this formula has now been wrong once already (13e8d003), that is worth a pin.
+
+The live instance is OpenRouter with a caller cap:
+
+```
+openrouter/anthropic/claude-opus-4-1  {"max_tokens": 8000}
+  -> reserve=8000  limit=None  served=None  budget=150000   (was 142000 @a1412967)
+```
+
+Added `test_nonzero_reservation_without_a_ceiling_preserves_window_max`, asserting the budget
+passes through verbatim and that the overflow shrink ladder still tightens it.
+
+## 4. Finding — stale catalog ceiling on `claude-sonnet-4-5` (Medium, upstream data) — **reported, not patched**
+
+Not a logic defect, but it should be on the record because it is the failure mode this PR's
+reservation exists to prevent.
+
+LiteLLM's **live** map reports `claude-sonnet-4-5: max_input_tokens=1000000` (the retired 1M
+beta), while Anthropic retired `context-1m-2025-08-07` for Sonnet 4/4.5 on 2026-04-30 — Sonnet
+4.5's real window is 200k, and 1M went GA on the `-4-6` models instead. So:
+
+```
+anthropic/claude-sonnet-4-5  ->  reserve=64000  limit=1000000  budget=min(150000, 936000)=150000
+wire: input ≲150000 + max_tokens 64000 = ~214000  >  the real 200000  ->  provider 400
+```
+
+Under a1412967's (wrong-but-conservative) formula this happened to be safe at 86000. The
+breakage starts once history exceeds ~136k tokens.
+
+**Why this is not a blocker and not patched here:**
+- The data is wrong upstream, not the derivation. The bundled backup map has the correct
+  `200000`; only the fetched live map is stale, and it self-corrects when LiteLLM updates.
+- `_SERVED_CEILINGS` already exists as the sanctioned override for exactly this
+  ("Served ceilings can differ materially from public model-card context windows"), and
+  `served_ceiling` correctly outranks `context_limit`. The escape hatch is in place.
+- Exposure in this repo is an eval baseline (`evals/wam_fusion/run_eval.py:68`) plus two unit
+  fixtures. Production agents use `claude-opus-4-6`, whose 1M figure is correct.
+- Patching it would mean hardcoding model strings into `_SERVED_CEILINGS`, which is exact-string
+  keyed and so cannot cover `claude-sonnet-4-5` / `anthropic/...` / `...-20250929` /
+  `us.anthropic....` / `vertex_ai/...` without whack-a-mole — against CLAUDE.md's
+  "extreme simplicity, no defensive guards" and out of this fixround's scope.
+
+**Recommended follow-up (separate issue):** add `_SERVED_CEILINGS` entries (or a normalizing
+lookup) if Sonnet 4.5 is ever promoted to a production route before LiteLLM corrects the entry.
+
+## 5. Minor notes (no action)
+
+- `min(window_max, max(1, ceiling - reservation))` floors at 1 when a caller cap exceeds the
+  model ceiling (e.g. `max_tokens=500000` on a 200k model). Budget 1 ⇒ `read_windowed_events`
+  raises "no budget remains for events". That request would be rejected by the provider anyway,
+  and fail-hard is the house stance; pre-existing on the `served_ceiling` path.
+- `model_context_limit`'s docstring cross-references `_apply_default_max_tokens` — verified
+  present at `completion.py:566`.
+- Only one production call site of `effective_window_max` (`loop.py:1042`); it passes both
+  resolvers. Grepped the full tree for the new symbols — no stragglers.
+
+## 6. Commands run
+
+| command | result |
+|---|---|
+| `uv run pytest tests/unit/test_context_budget.py tests/unit/test_completion_max_tokens.py -q` | **31 passed** (30 before the added test) |
+| `uv run pytest tests/unit -q -n 4 -x -k "context or window or completion or budget or token"` | **871 passed** |
+| `uv run ruff check <4 touched files>` | All checks passed |
+| `uv run ruff format --check <4 touched files>` | already formatted |
+| `uv run mypy <4 touched files>` | Success: no issues found |
+
+Live-catalog probes were run through `resolved_output_reservation` / `resolved_context_limit` /
+`effective_window_max` directly to produce the table in §1.
+
+## 7. Fix commits in this worktree (not pushed)
+
+- `c358e6fe` — `test(harness): pin window_max preservation when a reservation has no ceiling`
+
+---
+
+VERDICT: PASS

@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+# ``context_budget`` imports nothing from aios, so this seam adds no cycle.
+# ``EXPLICIT_OUTPUT_CAP_KEYS`` is re-exported (``as`` form, so mypy's
+# ``no_implicit_reexport`` under strict admits it) because the drift guard in
+# tests/unit/test_context_admission.py asserts this module and ``completion``
+# hold the *same object* as ``context_budget``.
+from aios.harness.context_budget import EXPLICIT_OUTPUT_CAP_KEYS as EXPLICIT_OUTPUT_CAP_KEYS
+from aios.harness.context_budget import explicit_output_cap as explicit_output_cap
+
 
 class AdmissionMode(StrEnum):
     OBSERVE = "observe"
@@ -111,11 +119,18 @@ def payload_digest(payload: Mapping[str, Any], *, route_revision: str | None) ->
 
 
 def _output_reserve(payload: Mapping[str, Any]) -> int | None:
-    for key in ("max_output_tokens", "max_tokens"):
-        value = payload.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-    return None
+    """The enforced output cap on the final payload, under ANY accepted spelling.
+
+    Delegates to :func:`~aios.harness.context_budget.explicit_output_cap` rather
+    than re-deriving either the accepted spellings or the validity rule. That
+    function is shared with the injection gate in ``completion`` and the
+    windowing reservation in ``context_budget``; when this logic was inline it
+    silently omitted ``max_completion_tokens``, so a request that carried a
+    real, provider-honoured cap under that spelling was still reported
+    ``unverified`` here and rejected under enforcement for having "no enforced
+    output token cap".
+    """
+    return explicit_output_cap(payload)
 
 
 def _method(counter: Counter) -> AdmissionMethod:

@@ -41,6 +41,7 @@ from aios.harness.completion import (
     ModelCallDeadlineError,
     call_litellm,
     estimate_cost_usd,
+    resolve_output_cap,
     stream_litellm,
 )
 from aios.harness.context_budget import effective_window_max
@@ -1020,10 +1021,15 @@ async def _run_session_step_body(
         # none and builds at full budget (shrink 1.0).
         _stop_reason = getattr(session, "stop_reason", None) or {}
         adaptive_context_retry = _stop_reason.get("context_overflow") is True
+        # The SAME resolver that writes the wire's one cap key (#2451), so the
+        # window reserves exactly what the request will carry.
+        output_cap = resolve_output_cap(capability_model, agent.litellm_extra)
         request_window_max = effective_window_max(
             model=capability_model,
             window_max=agent.window_max,
             params=agent.litellm_extra,
+            output_reserve=output_cap.value,
+            context_limit=output_cap.context_limit,
             shrink_factor=(
                 _stop_reason.get("context_shrink_factor", _CONTEXT_OVERFLOW_SHRINK_BASE)
                 if adaptive_context_retry

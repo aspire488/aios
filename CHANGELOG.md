@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Model calls now reserve the model's own output ceiling instead of inheriting
+  a provider default that silently truncates replies (#2451).** aios never set
+  `max_tokens`, and omitting it does NOT mean "unlimited" — on Anthropic-shaped
+  routes it means 4096. Extended-thinking tokens are drawn from that same
+  budget, so a hard turn could spend all 4096 reasoning and return EMPTY
+  assistant content with `finish_reason: "length"`: full cost billed, recorded
+  as a clean turn, no error raised — and the failure got *more* likely the
+  harder the task. `harness/completion.py` now defaults `max_tokens` from the
+  model's `max_output_tokens`, scoped to Anthropic-shaped routes (OpenAI's
+  no-`max_tokens` behaviour is already "as much as fits", and reserving there
+  regresses into OpenAI context-window 400s and OpenRouter credit-affordance
+  402s). An agent-supplied `max_tokens`/`max_completion_tokens` still wins
+  verbatim, and an unknown ceiling omits the key rather than sending
+  `max_tokens: None`. One resolver (`completion.resolve_output_cap`) decides
+  THE cap for every consumer: the first positive-int value in
+  `max_output_tokens > max_tokens > max_completion_tokens` order, else the
+  model-ceiling default. The request then carries exactly that one cap key —
+  `max_tokens` on Anthropic-shaped routes (LiteLLM passes `max_output_tokens`
+  through unrecognised and fills its own `max_tokens`, so a second spelling is a
+  second, competing cap), the winning spelling verbatim elsewhere (notably
+  `openai/responses/*`). Competing or invalid spellings are dropped and logged
+  (`explicit_output_cap_discarded`), and context windowing reserves the same
+  value the wire carries.
+
 - Vision capability now treats a missing LiteLLM catalog entry or absent
   `supports_vision` field as unknown and lets image consumers attempt safe
   inline delivery by default. Explicit overrides and catalog booleans remain

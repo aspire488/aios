@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cache
@@ -39,6 +40,13 @@ from aios.harness.context_admission import (
     admit_context,
     route_attestation,
 )
+
+# Re-exported (``as`` form, mypy's explicit re-export under strict) so the drift
+# guards can assert this module resolves the SAME objects as ``context_budget``.
+from aios.harness.context_budget import EXPLICIT_OUTPUT_CAP_KEYS as EXPLICIT_OUTPUT_CAP_KEYS
+from aios.harness.context_budget import explicit_output_cap as explicit_output_cap
+from aios.harness.context_budget import explicit_output_cap_entry as explicit_output_cap_entry
+from aios.harness.context_budget import is_output_cap_value as is_output_cap_value
 from aios.harness.request_body_budget import (
     body_limits_for_model,
     enforce_request_body_budget,
@@ -350,8 +358,19 @@ class ModelDescriptor:
     supports_thinking: bool
 
 
+def dispatch_override(params: Mapping[str, Any] | None) -> str | None:
+    """The ``custom_llm_provider`` LiteLLM will dispatch on, normalized like the credential resolver.
+
+    Only a non-empty ``str`` is an override (``services.model_providers`` applies
+    the same rule before its ``get_llm_provider`` sniff); anything else is
+    ``None`` so the ``@cache``'d lookups below keep hashable keys.
+    """
+    raw = (params or {}).get("custom_llm_provider")
+    return raw if isinstance(raw, str) and raw else None
+
+
 @cache
-def model_descriptor(model: str) -> ModelDescriptor:
+def model_descriptor(model: str, custom_llm_provider: str | None = None) -> ModelDescriptor:
     """Resolve the provider-quirk verdicts for ``model``.
 
     One ``litellm.get_llm_provider`` sniff feeds both projections. Pure
@@ -383,6 +402,12 @@ def model_descriptor(model: str) -> ModelDescriptor:
       silently dropped by OpenRouter for non-OpenAI backends and could
       trip parameter validation on some adapter versions.
 
+    **Dispatch override.** ``custom_llm_provider`` is passed to
+    ``get_llm_provider`` exactly as LiteLLM's own dispatch (and the credential
+    resolver) does, so ``model="gpt-4", custom_llm_provider="anthropic"``
+    classifies as Anthropic and ``model="claude-*", custom_llm_provider="openai"``
+    as OpenAI. Callers without the agent's params pass ``None`` (bare string).
+
     Unknown model strings (``get_llm_provider`` raises) collapse to a
     safe ``NONE`` — the no-op posture for both cache gates.
 
@@ -397,7 +422,9 @@ def model_descriptor(model: str) -> ModelDescriptor:
     ``False`` when it can't tell).
     """
     try:
-        model_name, provider, _, _ = litellm.get_llm_provider(model)
+        model_name, provider, _, _ = litellm.get_llm_provider(
+            model, custom_llm_provider=custom_llm_provider
+        )
     except Exception:
         provider, model_name = "", model
     lower = (model_name or model).lower()
@@ -413,6 +440,181 @@ def model_descriptor(model: str) -> ModelDescriptor:
         channel = CacheChannel.NONE
     supports_thinking = "claude" in model.lower() or litellm.supports_reasoning(model)
     return ModelDescriptor(cache_channel=channel, supports_thinking=supports_thinking)
+
+
+@cache
+def default_max_output_tokens(model: str, custom_llm_provider: str | None = None) -> int | None:
+    """The model's own output ceiling, or ``None`` when it can't be established.
+
+    Resolves ``max_output_tokens`` from LiteLLM's bundled capability map. Pure
+    function of the model string; cached for the same reason
+    :func:`model_descriptor` is (called once per inference step, low
+    distinct-model cardinality).
+
+    **``None`` is a real answer, not a failure to be papered over.** An unknown
+    model, a catalog entry with no ``max_output_tokens``, a lookup that raises,
+    or a non-positive value all collapse to ``None``, and the caller then omits
+    ``max_tokens`` entirely. Sending ``max_tokens: None`` would be strictly
+    worse than sending nothing: several provider adapters serialize an explicit
+    ``None`` into the request body, turning a silent truncation into a 400.
+    """
+    try:
+        info = litellm.get_model_info(model, custom_llm_provider=custom_llm_provider)
+    except Exception:
+        # ``get_model_info`` raises a mix of BadRequestError (unknown model)
+        # and bare Exception depending on the miss; the verdict is the same.
+        return None
+    value = info.get("max_output_tokens") if info else None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        return None
+    return value
+
+
+def _uses_anthropic_max_tokens_default(model: str, params: Mapping[str, Any]) -> bool:
+    """Whether this route gets the harness's model-ceiling default (see :func:`resolve_output_cap`)."""
+    override = dispatch_override(params)
+    return (
+        not (model.startswith("openrouter/") or override == "openrouter")
+        and model_descriptor(model, override).cache_channel is CacheChannel.ANTHROPIC
+    )
+
+
+@cache
+def model_context_limit(model: str, custom_llm_provider: str | None = None) -> int | None:
+    """The model's total context limit, or ``None`` when it can't be established.
+
+    Resolves ``max_input_tokens`` from LiteLLM's capability map — the ceiling an
+    Anthropic-shaped route charges ``input + max_tokens`` against. Same
+    **``None``-is-a-real-answer** stance as :func:`default_max_output_tokens`.
+    """
+    try:
+        info = litellm.get_model_info(model, custom_llm_provider=custom_llm_provider)
+    except Exception:
+        return None
+    value = info.get("max_input_tokens") if info else None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        return None
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class OutputCap:
+    """THE answer to "what output cap does this request carry" (#2451 / #2453).
+
+    * ``value`` — the one cap the provider will enforce, or ``None`` when the
+      wire carries no cap key at all (provider default applies).
+    * ``key`` — the one spelling ``value`` goes on the wire under.
+    * ``context_limit`` — the limit ``input + value`` is charged against, when
+      this module is the one reserving the output (Anthropic default routes).
+    """
+
+    value: int | None
+    key: str | None
+    context_limit: int | None
+
+
+def resolve_output_cap(model: str, params: Mapping[str, Any] | None) -> OutputCap:
+    """The ONE function that decides a request's output cap.
+
+    Every consumer reads this answer and none re-derives it: the wire
+    normalization (:func:`_apply_output_cap`), windowing (``loop`` passes
+    ``value``/``context_limit`` into ``effective_window_max``), and — because
+    the wire then carries exactly one cap key — the admission gate, which parses
+    the final payload with the same :func:`explicit_output_cap`.
+
+    Rules, in order:
+
+    1. **Caller cap.** :func:`explicit_output_cap` — the first *valid* (positive,
+       non-bool ``int``) value in :data:`EXPLICIT_OUTPUT_CAP_KEYS` precedence
+       order (``max_output_tokens`` > ``max_tokens`` > ``max_completion_tokens``).
+       Invalid values are not caps; they never win and never reach the wire.
+    2. **Model-ceiling default** — only on routes :func:`_uses_anthropic_max_tokens_default`
+       admits (Anthropic-shaped, minus OpenRouter's 402-on-reservation), and
+       only when the catalog knows the ceiling. Omitting ``max_tokens`` there
+       means a 4096 provider default, which is the #2451 defect.
+    3. Otherwise no cap.
+
+    Why the default is scoped: on OpenAI-shaped routes omitting ``max_tokens``
+    already means "as much as fits", and reserving the full ceiling there is a
+    regression (prompt + ``max_tokens`` > window is a 400). OpenRouter prices
+    against the *reservation* and 402s a ceiling a key cannot afford, so it keeps
+    its pre-fix provider default — tested on ``custom_llm_provider`` as well as
+    the prefix, because litellm dispatches on the override.
+
+    **Key.** Anthropic-shaped routes (including OpenRouter/Vertex/Bedrock
+    Claude) read ``max_tokens``; litellm passes ``max_output_tokens`` through
+    unrecognised and then fills its own ``max_tokens``, so the cap MUST travel
+    under ``max_tokens`` there. Every other route keeps the winning spelling
+    verbatim (``openai/responses/*`` natively reads ``max_output_tokens``).
+    """
+    params = params or {}
+    # Route shape comes from the provider LiteLLM will DISPATCH to, i.e. with
+    # ``custom_llm_provider`` applied — not from the bare model string.
+    override = dispatch_override(params)
+    anthropic_shaped = model_descriptor(model, override).cache_channel is CacheChannel.ANTHROPIC
+    defaulting = _uses_anthropic_max_tokens_default(model, params)
+    context_limit = model_context_limit(model, override) if defaulting else None
+    entry = explicit_output_cap_entry(params)
+    if entry is not None:
+        key, value = entry
+        return OutputCap(
+            value=value,
+            key="max_tokens" if anthropic_shaped else key,
+            context_limit=context_limit,
+        )
+    ceiling = default_max_output_tokens(model, override) if defaulting else None
+    return OutputCap(
+        value=ceiling,
+        key="max_tokens" if ceiling is not None else None,
+        context_limit=context_limit,
+    )
+
+
+def _apply_output_cap(kwargs: dict[str, Any], model: str) -> None:
+    """Rewrite ``kwargs`` so the wire carries exactly :func:`resolve_output_cap`'s answer.
+
+    Every caller spelling is removed and the resolved cap is written back under
+    its one key. Removing is what makes the property hold by construction: the
+    previous per-case fold returned early when ``max_tokens`` /
+    ``max_completion_tokens`` were present and left ``max_output_tokens``
+    alongside them, so the Anthropic request carried competing caps while
+    admission/windowing reserved a different one (#2453 P1). Anything removed
+    that was not the winner is LOGGED — swallowing a caller parameter silently
+    is the defect shape this module rejects elsewhere.
+    """
+    cap = resolve_output_cap(model, kwargs)
+    supplied = {key: kwargs.pop(key) for key in EXPLICIT_OUTPUT_CAP_KEYS if key in kwargs}
+    if cap.key is not None:
+        kwargs[cap.key] = cap.value
+    discarded = {
+        key: value
+        for key, value in supplied.items()
+        if not (is_output_cap_value(value) and value == cap.value)
+    }
+    if discarded:
+        log.warning(
+            "explicit_output_cap_discarded",
+            model=model,
+            discarded=discarded,
+            sent={cap.key: cap.value} if cap.key is not None else {},
+            detail=(
+                "caller named competing or unusable output caps; exactly one cap is sent "
+                "(first positive int in max_output_tokens > max_tokens > "
+                "max_completion_tokens order, else the model-ceiling default)"
+            ),
+        )
+    if cap.value is None and _uses_anthropic_max_tokens_default(model, kwargs):
+        # Nothing authoritative to reserve. Leave the key absent (never None) so
+        # the provider applies its own default — the pre-fix floor, not a guess.
+        log.warning(
+            "model_max_output_tokens_unknown",
+            model=model,
+            detail=(
+                "no max_output_tokens in the capability map; leaving max_tokens unset, "
+                "so this route falls back to the provider default (4096 on Anthropic) "
+                "and long replies may truncate silently"
+            ),
+        )
 
 
 def _apply_provider_cache_hints(
@@ -698,6 +900,9 @@ def _build_litellm_kwargs(
         effective_extra["allowed_openai_params"] = sorted(passthrough)
     if effective_extra:
         kwargs.update(effective_extra)
+    # AFTER the caller's extras are merged, so every caller spelling is visible
+    # to the one resolver; the wire then carries exactly its answer.
+    _apply_output_cap(kwargs, model)
     _apply_provider_cache_hints(kwargs, model, session_id)
     return kwargs
 
