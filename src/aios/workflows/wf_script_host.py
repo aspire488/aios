@@ -727,8 +727,8 @@ def _agent_error_from(error_info: Any) -> AgentError:
         message = info["message"]
     elif kind == "timeout" and isinstance(bound, str):
         message = _AGENT_TIMEOUT_BOUND_MESSAGES.get(
-        bound, _AGENT_ERROR_DEFAULT_MESSAGES["timeout"]
-    )
+            bound, _AGENT_ERROR_DEFAULT_MESSAGES["timeout"]
+        )
     else:
         message = _AGENT_ERROR_DEFAULT_MESSAGES.get(kind, "the agent failed")
     if kind == "no_return":
