@@ -20,6 +20,71 @@ from aios.services.litellm_params import (
 _SRC = Path(__file__).resolve().parents[2] / "src"
 
 
+def test_supported_openai_param_is_not_forced_through_raw(monkeypatch: Any) -> None:
+    """A mapped parameter must stay available to LiteLLM's translation layer."""
+    monkeypatch.setattr(
+        litellm,
+        "get_supported_openai_params",
+        lambda _model: ["reasoning_effort", "temperature"],
+    )
+
+    kwargs = completion._build_litellm_kwargs(
+        model="anthropic/claude-opus-5-5",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        auth=None,
+        extra={"reasoning_effort": "high"},
+        session_id=None,
+        stream=False,
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert "allowed_openai_params" not in kwargs
+
+
+def test_unsupported_openai_param_stays_forced_through(monkeypatch: Any) -> None:
+    """The stale-capability-map escape hatch still applies to unknown parameters."""
+    monkeypatch.setattr(
+        litellm,
+        "get_supported_openai_params",
+        lambda _model: ["temperature"],
+    )
+
+    kwargs = completion._build_litellm_kwargs(
+        model="anthropic/claude-opus-5-5",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        auth=None,
+        extra={"reasoning_effort": "high"},
+        session_id=None,
+        stream=False,
+    )
+
+    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+
+def test_explicit_allowed_openai_param_remains_authoritative(monkeypatch: Any) -> None:
+    """An explicit operator allow-list is preserved even for mapped parameters."""
+    monkeypatch.setattr(
+        litellm,
+        "get_supported_openai_params",
+        lambda _model: ["reasoning_effort", "temperature"],
+    )
+
+    kwargs = completion._build_litellm_kwargs(
+        model="anthropic/claude-opus-5-5",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        auth=None,
+        extra={"reasoning_effort": "high", "allowed_openai_params": ["reasoning_effort"]},
+        session_id=None,
+        stream=False,
+    )
+
+    assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+
 def test_stale_capability_map_is_reported_at_config_save(monkeypatch: Any) -> None:
     # Model metadata may refresh independently of the locked LiteLLM package. Exercise a
     # deliberately stale snapshot instead of depending on today's remote capability map.
