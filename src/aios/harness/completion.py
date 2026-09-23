@@ -894,7 +894,8 @@ def _build_litellm_kwargs(
     # Centrally allow every standard OpenAI-shaped param the caller supplied so
     # new provider models are not rejected locally before reaching the wire.
     # Preserve any operator-provided additions for non-standard adapter params.
-    passthrough = openai_params_in(effective_extra)
+    supported = set(litellm.get_supported_openai_params(model) or [])
+    passthrough = openai_params_in(effective_extra) - supported
     passthrough.update(effective_extra.get("allowed_openai_params") or [])
     if passthrough:
         effective_extra["allowed_openai_params"] = sorted(passthrough)
