@@ -1125,6 +1125,7 @@ async def stream_litellm(
     # defeating ``loop.REFUSAL_FINISH_REASON`` gating on the streaming path.
     # Make it sticky: once seen on the wire, override the assembled value.
     saw_content_filter = False
+    saw_length = False
     try:
         while True:
             guard_timeout = _STREAM_TTFT_TIMEOUT_S if first else _STREAM_INTER_CHUNK_TIMEOUT_S
@@ -1163,8 +1164,11 @@ async def stream_litellm(
             # to avoid a loop<->completion import cycle). ``getattr`` guard: real
             # litellm chunks always carry ``finish_reason`` (defaults None/""), but
             # a partial/edge chunk that omits it must not crash the stream loop.
-            if getattr(chunk.choices[0], "finish_reason", None) == "content_filter":
+            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+            if finish_reason == "content_filter":
                 saw_content_filter = True
+            elif finish_reason == "length":
+                saw_length = True
             content = chunk.choices[0].delta.content
             if content:
                 payload = json.dumps({"delta": content})
@@ -1209,6 +1213,8 @@ async def stream_litellm(
     # path: only fires when the wire actually carried a ``content_filter``.
     if saw_content_filter and finish_reason != "content_filter":
         finish_reason = "content_filter"
+    elif saw_length and finish_reason != "length":
+        finish_reason = "length"
     return LlmResponse.from_message(
         message,
         usage=usage,
