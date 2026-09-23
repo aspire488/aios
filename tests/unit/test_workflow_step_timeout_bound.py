@@ -26,8 +26,14 @@ async def test_resolve_agent_call_timeout_identifies_triggered_bound(
     conn.transaction.return_value = _Transaction()
     with (
         patch("aios.workflows.step.get_settings", return_value=Mock(cancel_cascade_enabled=False)),
-        patch("aios.workflows.step.db_queries.derive_response", side_effect=[None, Err(error={"kind": "timeout", "bound": expected_bound})]),
-        patch("aios.workflows.step.db_queries.write_response_if_absent", new=AsyncMock(return_value=True)),
+        patch(
+            "aios.workflows.step.db_queries.derive_response",
+            side_effect=[None, Err(error={"kind": "timeout", "bound": expected_bound})],
+        ),
+        patch(
+            "aios.workflows.step.db_queries.write_response_if_absent",
+            new=AsyncMock(return_value=True),
+        ),
     ):
         result = await _resolve_agent_call(
             conn,
