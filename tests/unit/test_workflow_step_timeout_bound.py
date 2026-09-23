@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -23,7 +23,7 @@ async def test_resolve_agent_call_timeout_identifies_triggered_bound(
 ) -> None:
     conn = AsyncMock()
     conn.fetchval.return_value = spent
-    conn.transaction.return_value = _Transaction()
+    conn.transaction = MagicMock(return_value=_Transaction())
     with (
         patch("aios.workflows.step.get_settings", return_value=Mock(cancel_cascade_enabled=False)),
         patch(
