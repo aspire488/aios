@@ -80,9 +80,12 @@ class AgentError(Exception):
     or an invalid ``output_schema``).
     """
 
-    def __init__(self, message: str, *, kind: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, kind: str | None = None, bound: str | None = None
+    ) -> None:
         super().__init__(message)
         self.kind = kind
+        self.bound = bound
 
 
 class AgentNoReturnError(AgentError):
@@ -703,6 +706,10 @@ _AGENT_ERROR_DEFAULT_MESSAGES: dict[str | None, str] = {
     "child_gone": "the agent was archived or deleted before responding to the request",
     "timeout": "the agent did not respond within its wall-clock deadline",
 }
+_AGENT_TIMEOUT_BOUND_MESSAGES: dict[str, str] = {
+    "deadline": "the agent did not respond within its wall-clock deadline",
+    "spend": "the agent stopped after reaching its spend ceiling",
+}
 
 
 def _agent_error_from(error_info: Any) -> AgentError:
@@ -711,10 +718,16 @@ def _agent_error_from(error_info: Any) -> AgentError:
     :class:`AgentNoReturnError` subtype; everything else to the base class."""
     info = error_info if isinstance(error_info, dict) else {}
     kind = info.get("kind")
-    message = info.get("message") or _AGENT_ERROR_DEFAULT_MESSAGES.get(kind, "the agent failed")
+    bound = info.get("bound")
+    if info.get("message"):
+        message = info["message"]
+    elif kind == "timeout" and isinstance(bound, str):
+        message = _AGENT_TIMEOUT_BOUND_MESSAGES.get(bound, _AGENT_ERROR_DEFAULT_MESSAGES["timeout"])
+    else:
+        message = _AGENT_ERROR_DEFAULT_MESSAGES.get(kind, "the agent failed")
     if kind == "no_return":
-        return AgentNoReturnError(message, kind=kind)
-    return AgentError(message, kind=kind)
+        return AgentNoReturnError(message, kind=kind, bound=bound)
+    return AgentError(message, kind=kind, bound=bound)
 
 
 # ─── the manual .send() driver (a deterministic cooperative scheduler) ────────
