@@ -1632,6 +1632,8 @@ async def _run_session_step_body(
             # produced the counts in this span.
             "token_baseline_v": session_baseline,
             "model": agent.model,
+            "finish_reason": finish_reason,
+            "output_truncated": finish_reason == "length",
             **(
                 llm_response.admission_report.as_event_fields()
                 if llm_response.admission_report is not None
@@ -1640,6 +1642,15 @@ async def _run_session_step_body(
         },
         account_id=account_id,
     )
+
+    if finish_reason == "length":
+        log.warning(
+            "step.model_output_truncated",
+            session_id=session_id,
+            model=agent.model,
+            finish_reason=finish_reason,
+            streaming=subscribed,
+        )
 
     # Charge cumulative session-level usage AFTER the model response is durably
     # recorded — the assistant message persisted below, or the refusal span in
