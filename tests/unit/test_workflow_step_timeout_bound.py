@@ -8,6 +8,7 @@ import pytest
 
 from aios.models.sessions import Err
 from aios.workflows.step import _resolve_agent_call
+from aios.workflows.wf_script_host import _agent_error_from
 
 
 class _Transaction:
@@ -24,12 +25,14 @@ class _Transaction:
     [
         (timedelta(seconds=301), 0, 0, "deadline"),
         (timedelta(seconds=10), 1_000_000, 1_000_000, "spend"),
+        (timedelta(seconds=301), 1_000_000, 1_000_000, "spend"),
+        (timedelta(seconds=301), 1_000_000, None, "deadline"),
     ],
 )
 async def test_resolve_agent_call_timeout_identifies_triggered_bound(
     now_offset: timedelta,
     ceiling: int,
-    spent: int,
+    spent: int | None,
     expected_bound: str,
 ) -> None:
     conn = AsyncMock()
@@ -65,3 +68,28 @@ async def test_resolve_agent_call_timeout_identifies_triggered_bound(
         outcome=written,
     )
     assert result is written
+
+
+@pytest.mark.parametrize(
+    ("bound", "expected_message"),
+    [
+        ("deadline", "the agent did not respond within its wall-clock deadline"),
+        ("spend", "the agent stopped after reaching its spend ceiling"),
+    ],
+)
+def test_agent_error_from_timeout_exposes_bound_and_message(
+    bound: str, expected_message: str
+) -> None:
+    error = _agent_error_from({"kind": "timeout", "bound": bound})
+
+    assert error.kind == "timeout"
+    assert error.bound == bound
+    assert str(error) == expected_message
+
+
+def test_agent_error_from_legacy_timeout_preserves_message_and_has_no_bound() -> None:
+    error = _agent_error_from({"kind": "timeout"})
+
+    assert error.kind == "timeout"
+    assert error.bound is None
+    assert str(error) == "the agent did not respond within its wall-clock deadline"
