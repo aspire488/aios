@@ -81,7 +81,11 @@ class AgentError(Exception):
     """
 
     def __init__(
-        self, message: str, *, kind: str | None = None, bound: str | None = None
+        self,
+        message: str,
+        *,
+        kind: str | None = None,
+        bound: str | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -722,7 +726,9 @@ def _agent_error_from(error_info: Any) -> AgentError:
     if info.get("message"):
         message = info["message"]
     elif kind == "timeout" and isinstance(bound, str):
-        message = _AGENT_TIMEOUT_BOUND_MESSAGES.get(bound, _AGENT_ERROR_DEFAULT_MESSAGES["timeout"])
+        message = _AGENT_TIMEOUT_BOUND_MESSAGES.get(
+        bound, _AGENT_ERROR_DEFAULT_MESSAGES["timeout"]
+    )
     else:
         message = _AGENT_ERROR_DEFAULT_MESSAGES.get(kind, "the agent failed")
     if kind == "no_return":
