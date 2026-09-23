@@ -1,10 +1,21 @@
+from __future__ import annotations
+
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 from aios.models.sessions import Err
 from aios.workflows.step import _resolve_agent_call
+
+
+class _Transaction:
+    async def __aenter__(self) -> _Transaction:
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool:
+        return False
 
 
 @pytest.mark.asyncio
@@ -24,16 +35,15 @@ async def test_resolve_agent_call_timeout_identifies_triggered_bound(
     conn = AsyncMock()
     conn.fetchval.return_value = spent
     conn.transaction = MagicMock(return_value=_Transaction())
+    written = Err(error={"kind": "timeout", "bound": expected_bound})
+    write = AsyncMock(return_value=True)
     with (
         patch("aios.workflows.step.get_settings", return_value=Mock(cancel_cascade_enabled=False)),
         patch(
             "aios.workflows.step.db_queries.derive_response",
-            side_effect=[None, Err(error={"kind": "timeout", "bound": expected_bound})],
+            side_effect=[None, written],
         ),
-        patch(
-            "aios.workflows.step.db_queries.write_response_if_absent",
-            new=AsyncMock(return_value=True),
-        ),
+        patch("aios.workflows.step.db_queries.write_response_if_absent", new=write),
     ):
         result = await _resolve_agent_call(
             conn,
@@ -46,14 +56,12 @@ async def test_resolve_agent_call_timeout_identifies_triggered_bound(
             cost_ceiling_microusd=ceiling,
         )
 
-    assert isinstance(result, Err)
-    assert result.error["kind"] == "timeout"
-    assert result.error["bound"] == expected_bound
-
-
-class _Transaction:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
+    # The re-derive is mocked, so the product contract lives in what gets WRITTEN.
+    write.assert_awaited_once_with(
+        conn,
+        "child",
+        account_id="account",
+        request_id="request",
+        outcome=written,
+    )
+    assert result is written
