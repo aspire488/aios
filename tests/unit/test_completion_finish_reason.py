@@ -192,9 +192,7 @@ class TestStreamStickyLength:
             return _FakeStream(chunks)
 
         monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-        monkeypatch.setattr(
-            litellm, "stream_chunk_builder", _clobbered_builder(trailer or "")
-        )
+        monkeypatch.setattr(litellm, "stream_chunk_builder", _clobbered_builder(trailer or ""))
 
         response = await completion.stream_litellm(
             completion.LlmRequest(
