@@ -172,3 +172,60 @@ class TestStreamStickyContentFilter:
             pool=_StubPool(),
         )
         assert response.finish_reason == "stop"
+
+
+class TestStreamStickyLength:
+    """A provider-side length stop must survive trailing usage/stop chunks."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trailer", [None, "", "stop"])
+    async def test_length_survives_trailing_clobber(
+        self, monkeypatch: pytest.MonkeyPatch, trailer: str | None
+    ) -> None:
+        chunks = [
+            _FakeChunk(finish_reason=None, content="partial answer"),
+            _FakeChunk(finish_reason="length"),
+            _FakeChunk(finish_reason=trailer),
+        ]
+
+        async def fake_acompletion(**_kwargs: object) -> _FakeStream:
+            return _FakeStream(chunks)
+
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+        monkeypatch.setattr(litellm, "stream_chunk_builder", _clobbered_builder(trailer or ""))
+
+        response = await completion.stream_litellm(
+            completion.LlmRequest(
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="sess_length",
+            ),
+            model="anthropic/claude-fable-5",
+            pool=_StubPool(),
+        )
+        assert response.finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_content_filter_takes_precedence_over_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chunks = [
+            _FakeChunk(finish_reason="length"),
+            _FakeChunk(finish_reason="content_filter"),
+            _FakeChunk(finish_reason="stop"),
+        ]
+
+        async def fake_acompletion(**_kwargs: object) -> _FakeStream:
+            return _FakeStream(chunks)
+
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+        monkeypatch.setattr(litellm, "stream_chunk_builder", _clobbered_builder("stop"))
+
+        response = await completion.stream_litellm(
+            completion.LlmRequest(
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="sess_precedence",
+            ),
+            model="anthropic/claude-fable-5",
+            pool=_StubPool(),
+        )
+        assert response.finish_reason == "content_filter"
