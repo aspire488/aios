@@ -1222,3 +1222,541 @@ class TestCustomTools:
 
         session = await sess_svc.create_session(
             harness._pool,
+            agent_id=agent.id,
+            environment_id=harness._env_id,
+            title="mixed-tools-test",
+            metadata={},
+            account_id=account_id,
+        )
+        await sess_svc.append_user_message(
+            harness._pool, session.id, "Do both", account_id=account_id
+        )
+
+        # Step 1: model calls both tools
+        await harness.run_step(session.id)
+        await harness.wait_for_tools(session.id)
+
+        # Custom tool is awaiting external execution (built-in already
+        # completed) → session is ACTIVE: the unresolved custom call resumes on
+        # a result POST without a user message.
+        s = await harness.session(session.id)
+        assert s.status == "active"
+        assert s.stop_reason == {"type": "end_turn"}
+        assert {a.tool_call_id for a in s.awaiting} == {"call_lookup"}
+
+        # The built-in tool (echo) should have already completed
+        events = await harness.events(session.id)
+        echo_result = next(
+            (
+                e.data
+                for e in events
+                if e.data.get("role") == "tool" and e.data.get("tool_call_id") == "call_echo"
+            ),
+            None,
+        )
+        assert echo_result is not None
+
+        # Submit custom tool result
+        await sess_svc.append_event(
+            harness._pool,
+            session.id,
+            "message",
+            {"role": "tool", "tool_call_id": "call_lookup", "content": '{"value": "bar"}'},
+            account_id=account_id,
+        )
+
+        # Step 2: model sees both results
+        await harness.run_step(session.id)
+        assert last_assistant_content(await harness.events(session.id)) == "Got both results."
+
+
+# ─── permission policies ────────────────────────────────────────────────────
+
+
+@needs_docker
+class TestPermissionPolicies:
+    """Tests for the always_ask permission policy and tool confirmation flow.
+
+    These tests use real built-in tool names (glob, grep, etc.) with
+    overridden handlers to avoid needing Docker for sandbox tools.
+    The registry snapshot/restore in conftest ensures cleanup.
+    """
+
+    @staticmethod
+    def _override_tool(name: str, handler: Any) -> None:
+        """Replace a registered tool's handler for this test."""
+        from dataclasses import replace
+
+        from aios.tools.registry import registry
+
+        old = registry.get(name)
+        registry._tools[name] = replace(old, handler=handler)
+
+    async def test_always_ask_idles_with_awaiting_confirm(self, harness: Harness) -> None:
+        """Model calls an always_ask tool → call appears in ``session.awaiting`` with builtin kind."""
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["a.txt"]}
+
+        self._override_tool("glob", fake_glob)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[tool_call("glob", {"pattern": "*.txt"}, call_id="call_ask1")]
+                ),
+            ]
+        )
+        session = await harness.start(
+            "list files",
+            tool_specs=[ToolSpec(type="glob", permission="always_ask")],
+        )
+        await harness.run_step(session.id)
+
+        # always_ask tool pending confirmation → session is ACTIVE: it resumes
+        # on an operator confirmation (no user message needed).
+        s = await harness.session(session.id)
+        assert s.status == "active"
+        assert s.stop_reason == {"type": "end_turn"}
+        assert {a.tool_call_id for a in s.awaiting} == {"call_ask1"}
+        assert s.awaiting[0].kind == "builtin"
+
+    async def test_always_ask_allow_executes_tool(self, harness: Harness) -> None:
+        """Confirm allow → tool executes → model sees result → responds."""
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["found.txt"]}
+
+        self._override_tool("glob", fake_glob)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[tool_call("glob", {"pattern": "*.txt"}, call_id="call_allow1")]
+                ),
+                assistant("Found found.txt"),
+            ]
+        )
+        session = await harness.start(
+            "list files",
+            tool_specs=[ToolSpec(type="glob", permission="always_ask")],
+        )
+
+        # Step 1: model calls always_ask tool → call appears in awaiting
+        await harness.run_step(session.id)
+        s = await harness.session(session.id)
+        assert s.stop_reason == {"type": "end_turn"}
+        assert {a.tool_call_id for a in s.awaiting} == {"call_allow1"}
+
+        # Confirm allow
+        await harness.confirm_tool(session.id, "call_allow1", "allow")
+
+        # Step 2: worker dispatches confirmed tool
+        await harness.run_step(session.id)
+        await harness.wait_for_tools(session.id)
+
+        # Step 3: model sees tool result and responds
+        await harness.run_step(session.id)
+
+        events = await harness.events(session.id)
+        assert last_assistant_content(events) == "Found found.txt"
+
+        s = await harness.session(session.id)
+        assert s.status == "idle"
+        assert s.stop_reason == {"type": "end_turn"}
+
+    async def test_hold_appends_tool_requested_lifecycle(self, harness: Harness) -> None:
+        """Holding an always_ask call appends ``lifecycle/tool_requested``.
+
+        The request-side twin of ``tool_confirmed``: awaiting is derived per
+        read (and shifts under policy edits), so the log must record that the
+        harness held this call, ordered after the assistant message that
+        offered it and before the step's ``turn_ended``.
+        """
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["a.txt"]}
+
+        self._override_tool("glob", fake_glob)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[tool_call("glob", {"pattern": "*.txt"}, call_id="call_req1")]
+                ),
+            ]
+        )
+        session = await harness.start(
+            "list files",
+            tool_specs=[ToolSpec(type="glob", permission="always_ask")],
+        )
+        await harness.run_step(session.id)
+
+        events = await harness.all_events(session.id)
+        requested = [
+            e for e in events if e.kind == "lifecycle" and e.data.get("event") == "tool_requested"
+        ]
+        assert len(requested) == 1
+        assert requested[0].data == {
+            "event": "tool_requested",
+            "tool_call_id": "call_req1",
+            "name": "glob",
+            "kind": "builtin",
+        }
+        offer_seq = next(
+            e.seq for e in events if e.kind == "message" and e.data.get("role") == "assistant"
+        )
+        turn_end_seq = next(
+            e.seq for e in events if e.kind == "lifecycle" and e.data.get("event") == "turn_ended"
+        )
+        assert offer_seq < requested[0].seq < turn_end_seq
+
+    async def test_tool_requested_not_duplicated_across_steps(self, harness: Harness) -> None:
+        """The full hold → allow → dispatch → respond flow appends exactly one
+        ``tool_requested`` — re-wakes never re-offer prior calls."""
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["found.txt"]}
+
+        self._override_tool("glob", fake_glob)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[tool_call("glob", {"pattern": "*.txt"}, call_id="call_req2")]
+                ),
+                assistant("Found found.txt"),
+            ]
+        )
+        session = await harness.start(
+            "list files",
+            tool_specs=[ToolSpec(type="glob", permission="always_ask")],
+        )
+        await harness.run_step(session.id)
+        await harness.confirm_tool(session.id, "call_req2", "allow")
+        await harness.run_step(session.id)
+        await harness.wait_for_tools(session.id)
+        await harness.run_step(session.id)
+
+        events = await harness.all_events(session.id)
+        requested = [
+            e for e in events if e.kind == "lifecycle" and e.data.get("event") == "tool_requested"
+        ]
+        confirmed = [
+            e for e in events if e.kind == "lifecycle" and e.data.get("event") == "tool_confirmed"
+        ]
+        assert [e.data["tool_call_id"] for e in requested] == ["call_req2"]
+        assert [e.data["tool_call_id"] for e in confirmed] == ["call_req2"]
+        assert requested[0].seq < confirmed[0].seq
+
+    async def test_always_ask_deny_sends_error(self, harness: Harness) -> None:
+        """Confirm deny → model sees error with deny message → responds."""
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": []}
+
+        self._override_tool("glob", fake_glob)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[tool_call("glob", {"pattern": "*.txt"}, call_id="call_deny1")]
+                ),
+                assistant("I understand, the tool was denied."),
+            ]
+        )
+        session = await harness.start(
+            "list files",
+            tool_specs=[ToolSpec(type="glob", permission="always_ask")],
+        )
+
+        # Step 1: model calls always_ask tool → session idles
+        await harness.run_step(session.id)
+
+        # Deny with message
+        await harness.confirm_tool(session.id, "call_deny1", "deny", deny_message="Too dangerous.")
+
+        # Step 2: model sees the denial error and responds
+        await harness.run_step(session.id)
+
+        events = await harness.events(session.id)
+        deny_result = next(
+            (
+                e.data
+                for e in events
+                if e.data.get("role") == "tool" and e.data.get("tool_call_id") == "call_deny1"
+            ),
+            None,
+        )
+        assert deny_result is not None
+        assert deny_result.get("is_error") is True
+        assert "rejected" in deny_result.get("content", "").lower()
+        assert "Too dangerous" in deny_result.get("content", "")
+
+        assert last_assistant_content(events) == "I understand, the tool was denied."
+
+    async def test_mixed_allow_and_ask(self, harness: Harness) -> None:
+        """Model calls always_allow + always_ask → immediate executes, ask waits."""
+        from aios.models.agents import ToolSpec
+
+        async def fake_glob(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["a.txt"]}
+
+        async def fake_grep(
+            session_id: str, arguments: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            return {"matches": ["line 1: hello"]}
+
+        self._override_tool("glob", fake_glob)
+        self._override_tool("grep", fake_grep)
+
+        harness.script_model(
+            [
+                assistant(
+                    tool_calls=[
+                        tool_call("glob", {"pattern": "*.txt"}, call_id="call_fast"),
+                        tool_call("grep", {"pattern": "hello"}, call_id="call_slow"),
+                    ]
+                ),
+                assistant("Both tools done."),
+            ]
+        )
+        session = await harness.start(
+            "search files",
+            tool_specs=[
+                ToolSpec(type="glob"),  # always_allow (default)
+                ToolSpec(type="grep", permission="always_ask"),
+            ],
+        )
+
+        # Step 1: model calls both tools
+        await harness.run_step(session.id)
+        await harness.wait_for_tools(session.id)
+
+        # glob should have executed; grep is awaiting confirmation → session is
+        # ACTIVE (resumes on the operator confirmation, no user message needed).
+        s = await harness.session(session.id)
+        assert s.status == "active"
+        assert s.stop_reason == {"type": "end_turn"}
+        assert {a.tool_call_id for a in s.awaiting} == {"call_slow"}
+        assert s.awaiting[0].kind == "builtin"
+
+        # glob result should already be in the log
+        events = await harness.events(session.id)
+        fast_result = next(
+            (
+                e.data
+                for e in events
+                if e.data.get("role") == "tool" and e.data.get("tool_call_id") == "call_fast"
+            ),
+            None,
+        )
+        assert fast_result is not None
+
+        # Confirm grep
+        await harness.confirm_tool(session.id, "call_slow", "allow")
+
+        # Step 2: worker dispatches grep
+        await harness.run_step(session.id)
+        await harness.wait_for_tools(session.id)
+
+        # Step 3: model sees both results → responds
+        await harness.run_step(session.id)
+
+        assert last_assistant_content(await harness.events(session.id)) == "Both tools done."
+
+    async def test_disabled_tool_excluded_from_schema(self, harness: Harness) -> None:
+        """Agent with enabled=False tool → model schema doesn't include it."""
+        from aios.models.agents import ToolSpec
+
+        harness.script_model([assistant("Nothing to do.")])
+        session = await harness.start(
+            "hello",
+            tool_specs=[
+                ToolSpec(type="glob"),
+                ToolSpec(type="grep", enabled=False),
+            ],
+        )
+        await harness.run_until_idle(session.id)
+
+        # Check the tools kwarg passed to litellm
+        assert len(harness.model_calls) == 1
+        tools_sent = harness.model_calls[0].get("tools") or []
+        tool_names = [t["function"]["name"] for t in tools_sent]
+        assert "glob" in tool_names
+        assert "grep" not in tool_names
+
+    async def test_backward_compat_no_policy(self, harness: Harness) -> None:
+        """Agent without permission fields → everything executes immediately."""
+
+        async def echo_handler(session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return {"output": arguments.get("text", "")}
+
+        harness.register_tool("echo", echo_handler)
+
+        harness.script_model(
+            [
+                assistant(tool_calls=[tool_call("echo", {"text": "hi"})]),
+                assistant("Echo said hi."),
+            ]
+        )
+        # Use simple tools= (no permission/enabled set)
+        session = await harness.start("echo hi", tools=[])
+        await harness.run_until_idle(session.id)
+
+        events = await harness.events(session.id)
+        assert last_assistant_content(events) == "Echo said hi."
+
+        s = await harness.session(session.id)
+        assert s.status == "idle"
+        assert s.stop_reason == {"type": "end_turn"}
+
+
+# ─── full tier (with Docker) ─────────────────────────────────────────────────
+
+
+@needs_docker
+@pytest.mark.e2e
+# ─── usage and span events ──────────────────────────────────────────────────
+
+
+@needs_docker
+class TestUsageTracking:
+    async def test_basic_chat_has_usage(self, harness: Harness) -> None:
+        """After one turn, session.usage has non-zero token counts."""
+        harness.script_model([assistant("Hello!")])
+        session = await harness.start("Hi")
+        await harness.run_until_idle(session.id)
+
+        s = await harness.session(session.id)
+        assert s.usage.input_tokens > 0
+        assert s.usage.output_tokens > 0
+
+    async def test_usage_accumulates_across_steps(self, harness: Harness) -> None:
+        """Two model calls should produce higher totals than one."""
+
+        async def noop_handler(session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True}
+
+        harness.register_tool("noop", noop_handler)
+        harness.script_model(
+            [
+                assistant(tool_calls=[tool_call("noop", {})]),
+                assistant("Done."),
+            ]
+        )
+        session = await harness.start("do something", tools=[])
+        await harness.run_until_idle(session.id)
+
+        s = await harness.session(session.id)
+        # Two model calls x 10 prompt_tokens each = 20
+        assert s.usage.input_tokens == 20
+        assert s.usage.output_tokens == 10
+
+    async def test_span_events_emitted(self, harness: Harness) -> None:
+        """A single model call emits paired span start + end events."""
+        harness.script_model([assistant("Hello!")])
+        session = await harness.start("Hi")
+        await harness.run_until_idle(session.id)
+
+        all_evts = await harness.all_events(session.id)
+        model_spans = [
+            e
+            for e in all_evts
+            if e.kind == "span" and e.data["event"] in {"model_request_start", "model_request_end"}
+        ]
+        assert len(model_spans) == 2
+
+        start = model_spans[0]
+        end = model_spans[1]
+        assert start.data["event"] == "model_request_start"
+        assert end.data["event"] == "model_request_end"
+        assert end.data["model_request_start_id"] == start.id
+        assert end.data["is_error"] is False
+        assert end.data["model_usage"]["input_tokens"] == 10
+        assert end.data["model_usage"]["output_tokens"] == 5
+        assert "cost_usd" in end.data
+        assert end.data["cost_usd"] is None
+        # Recompute approx_tokens from the exact payload the harness
+        # captured litellm receiving; a future refactor that stamps on the
+        # wrong list would slowly skew the ratio without this equality
+        # check noticing.
+        from aios.harness.tokens import approx_tokens
+
+        assert harness.model_calls, "expected at least one litellm call"
+        sent = harness.model_calls[-1]
+        expected_local = approx_tokens(sent["messages"], tools=sent.get("tools"))
+        assert end.data["local_tokens"] == expected_local
+        assert end.data["model"] == "fake/test"
+
+    async def test_span_events_for_multi_step(self, harness: Harness) -> None:
+        """Two model calls produce two span pairs."""
+
+        async def noop_handler(session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True}
+
+        harness.register_tool("noop", noop_handler)
+        harness.script_model(
+            [
+                assistant(tool_calls=[tool_call("noop", {})]),
+                assistant("Done."),
+            ]
+        )
+        session = await harness.start("do something", tools=[])
+        await harness.run_until_idle(session.id)
+
+        all_evts = await harness.all_events(session.id)
+        model_spans = [
+            e
+            for e in all_evts
+            if e.kind == "span" and e.data["event"] in {"model_request_start", "model_request_end"}
+        ]
+        assert len(model_spans) == 4  # 2 start + 2 end
+
+        starts = [s for s in model_spans if s.data["event"] == "model_request_start"]
+        ends = [s for s in model_spans if s.data["event"] == "model_request_end"]
+        assert len(starts) == 2
+        assert len(ends) == 2
+
+        # Each end links to its own start
+        assert ends[0].data["model_request_start_id"] == starts[0].id
+        assert ends[1].data["model_request_start_id"] == starts[1].id
+
+
+# ─── full tier (needs Docker for containers + testcontainer) ────────────────
+
+
+class TestDockerIntegration:
+    async def test_bash_real_container(self, docker_harness: Harness) -> None:
+        """Real container, real docker exec."""
+        harness = docker_harness
+        harness.script_model(
+            [
+                assistant(tool_calls=[bash("echo hello from e2e")]),
+                assistant("The output was hello."),
+            ]
+        )
+        session = await harness.start("echo hello", tools=["bash"])
+        await harness.run_until_idle(session.id)
+
+        events = await harness.events(session.id)
+        tr = first_tool_result(events)
+        content = tr["content"]
+        assert "hello from e2e" in content
