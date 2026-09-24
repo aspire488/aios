@@ -139,9 +139,7 @@ async def mwf_runtime(
         await pool.close()
 
 
-async def _make_bound_session(
-    pool: asyncpg.Pool[Any], *, finish_reason: str = "stop"
-) -> str:
+async def _make_bound_session(pool: asyncpg.Pool[Any], *, finish_reason: str = "stop") -> str:
     script = _INNER_SCRIPT.replace("{finish_reason}", finish_reason)
     async with pool.acquire() as conn:
         wf = await wf_queries.insert_workflow(
@@ -380,9 +378,7 @@ async def test_repark_is_idempotent_no_double_harvest(mwf_runtime: asyncpg.Pool[
     assert len(await _assistant_messages(pool, session_id)) == 1
 
 
-async def test_harvest_length_finish_reason_preserves_turn(
-    mwf_runtime: asyncpg.Pool[Any],
-) -> None:
+async def test_harvest_length_finish_reason_preserves_turn(mwf_runtime: asyncpg.Pool[Any]) -> None:
     """A harvested length stop records truncation without crashing the shared tail."""
     pool = mwf_runtime
     session_id = await _make_bound_session(pool, finish_reason="length")
