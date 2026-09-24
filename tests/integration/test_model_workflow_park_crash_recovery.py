@@ -403,20 +403,13 @@ async def test_harvest_length_finish_reason_preserves_turn(mwf_runtime: asyncpg.
     assert assistants[0]["content"] == "recovered answer"
 
     events = await sessions_service.read_events(pool, session_id, account_id=_ACCOUNT)
-    end_spans = [
-        e.data
-        for e in events
-        if e.kind == "span" and e.data.get("event") == "model_request_end"
-    ]
+    end_spans = [e.data for e in events if e.kind == "span" and e.data.get("event") == "model_request_end"]
     assert len(end_spans) == 1
     assert end_spans[0]["finish_reason"] == "length"
     assert end_spans[0]["output_truncated"] is True
     assert end_spans[0]["model"] is not None
 
-    assert not any(
-        e.kind == "span" and e.data.get("event") == "harness_error"
-        for e in events
-    )
+    assert not any(e.kind == "span" and e.data.get("event") == "harness_error" for e in events)
 
 
 async def test_steady_state_park_is_not_double_parked(mwf_runtime: asyncpg.Pool[Any]) -> None:
