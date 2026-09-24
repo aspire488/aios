@@ -278,7 +278,9 @@ async def _resolve_agent_call(
                 child_id,
                 account_id=account_id,
                 request_id=request_id,
-                outcome=Err(error={"kind": "timeout"}),
+                outcome=Err(
+                    error={"kind": "timeout", "bound": "spend" if over_budget else "deadline"}
+                ),
             )
             if wrote and get_settings().cancel_cascade_enabled:
                 await db_queries.insert_session_cancel_marker(

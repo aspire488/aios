@@ -3446,7 +3446,7 @@ async def test_agent_call_times_out_when_child_never_responds(
         child = await db_queries.get_session_bare(conn, child_id, account_id="acc_wf")
     assert run is not None and run.status == "completed"
     assert run.output == {"timed_out": "timeout"}
-    assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
+    assert isinstance(resp, Err) and resp.error == {"kind": "timeout", "bound": "deadline"}
     assert child.archived_at is None  # left running — responding ≠ terminating
 
 
@@ -3493,7 +3493,7 @@ async def test_agent_call_resolves_when_child_exceeds_the_spend_ceiling(
         child = await db_queries.get_session_bare(conn, child_id, account_id="acc_wf")
     assert run is not None and run.status == "completed"
     assert run.output == {"stopped": "timeout"}
-    assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
+    assert isinstance(resp, Err) and resp.error == {"kind": "timeout", "bound": "spend"}
     assert child.archived_at is None  # left running — responding != terminating
     get_settings.cache_clear()
 
@@ -3614,7 +3614,7 @@ async def test_spend_ceiling_fires_at_exactly_the_ceiling(
         )
     assert run is not None and run.status == "completed"
     assert run.output == {"stopped": "timeout"}
-    assert isinstance(resp, Err) and resp.error == {"kind": "timeout"}
+    assert isinstance(resp, Err) and resp.error == {"kind": "timeout", "bound": "spend"}
     get_settings.cache_clear()
 
 
